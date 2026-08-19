@@ -1,0 +1,8 @@
+{
+  "services": {
+    "flaky": {
+      "command": "echo attempt; exit 1",
+      "restart": "on-failure"
+    }
+  }
+}

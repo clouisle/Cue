@@ -1,0 +1,13 @@
+{
+  "services": {
+    "frontend": {
+      "command": "for i in 1 2 3; do echo frontend log $i; sleep 0.2; done; printf partial-tail"
+    },
+    "backend": {
+      "command": "while true; do sleep 0.2; done"
+    },
+    "worker": {
+      "command": "echo worker booting; exit 3"
+    }
+  }
+}
