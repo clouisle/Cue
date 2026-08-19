@@ -3,12 +3,13 @@ mod runner;
 mod session;
 mod term;
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use config::Config;
 use runner::{ServiceEvent, SharedPids, Shutdown, signal_all};
@@ -155,12 +156,21 @@ fn check_no_running_session(cfg_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 后台启动全部服务，写会话状态后立即退出；工具退出后服务继续运行。
+/// 后台启动全部服务：按依赖波次 spawn，同步等待各层就绪后写状态退出。
 async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
     if cfg.services.is_empty() {
         eprintln!("error: no services defined in {}", cfg_path.display());
         return 1;
     }
+
+    let levels = match cfg.levels() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let required = cfg.required_conditions();
 
     let base = cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let dir = session::session_dir(cfg_path);
@@ -170,17 +180,57 @@ async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
     }
 
     let mut session_services = Vec::new();
+    let mut children: HashMap<String, std::process::Child> = HashMap::new();
+    let mut failed: HashSet<String> = HashSet::new();
     let mut failures = 0;
-    for (name, svc) in &cfg.services {
-        let log = dir.join(format!("{name}.log"));
-        match runner::spawn_detached(name, svc, &base, &log) {
-            Ok(pid) => session_services.push(session::SessionService {
-                name: name.clone(),
-                pid,
-                log,
-            }),
-            Err(e) => {
-                eprintln!("error: {e}");
+
+    for level in &levels {
+        // 依赖失败检查 + spawn 本层。
+        let mut wave = Vec::new();
+        for name in level {
+            let svc = &cfg.services[name];
+            if cfg.deps_of(name).keys().any(|d| failed.contains(d)) {
+                eprintln!("error: service '{name}' skipped: dependency failed to start");
+                failed.insert(name.clone());
+                failures += 1;
+                continue;
+            }
+            let log = dir.join(format!("{name}.log"));
+            match runner::spawn_detached(name, svc, &base, &log) {
+                Ok(child) => {
+                    let pid = child.id();
+                    children.insert(name.clone(), child);
+                    session_services.push(session::SessionService {
+                        name: name.clone(),
+                        pid,
+                        log,
+                    });
+                    wave.push(name.clone());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    failed.insert(name.clone());
+                    failures += 1;
+                }
+            }
+        }
+        // 同步等待本层就绪。
+        for name in &wave {
+            let cond = required.get(name).copied().unwrap_or(config::DepCondition::Started);
+            let ok = match cond {
+                config::DepCondition::Started => true,
+                config::DepCondition::Healthy => {
+                    let hc = cfg.services[name].healthcheck.as_ref().expect("validated");
+                    wait_healthy_sync(hc)
+                }
+                config::DepCondition::Completed => children
+                    .get_mut(name)
+                    .map(wait_completed_sync)
+                    .unwrap_or(false),
+            };
+            if !ok {
+                eprintln!("error: service '{name}' not ready; dependents skipped");
+                failed.insert(name.clone());
                 failures += 1;
             }
         }
@@ -215,6 +265,39 @@ async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
         1
     } else {
         0
+    }
+}
+
+/// 同步健康检查轮询（后台模式阻塞式）。
+fn wait_healthy_sync(hc: &config::Healthcheck) -> bool {
+    let deadline = std::time::Instant::now() + hc.budget();
+    loop {
+        if runner::check_healthy_once(&hc.test, hc.timeout) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// 后台模式 completed：持有 Child 句柄 try_wait 收割，退出码 0 即完成。
+const COMPLETED_BUDGET_SECS: u64 = 60;
+
+fn wait_completed_sync(child: &mut std::process::Child) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(COMPLETED_BUDGET_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
     }
 }
 
@@ -414,6 +497,15 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
         return 1;
     }
 
+    let levels = match cfg.levels() {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let required = cfg.required_conditions();
+
     let colors_on = use_color(no_color);
     let names: Vec<&str> = cfg.services.keys().map(|s| s.as_str()).collect();
     runner::print_status(&term::dim(&format!(
@@ -427,10 +519,19 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
     let base = cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let shutdown = Arc::new(Shutdown::new());
     let pids: SharedPids = Arc::new(Mutex::new(Vec::new()));
+    let ready: Arc<Mutex<HashMap<String, bool>>> = Arc::new(Mutex::new(HashMap::new()));
     let (tx, mut rx) = mpsc::channel::<ServiceEvent>(64);
+    let mut gates: HashMap<String, Arc<Notify>> = HashMap::new();
 
-    let mut remaining = cfg.services.len();
     for (i, (name, svc)) in cfg.services.iter().enumerate() {
+        let gate = Arc::new(Notify::new());
+        gates.insert(name.clone(), gate.clone());
+        let startup = Arc::new(runner::Startup {
+            gate,
+            ready: ready.clone(),
+            deps: cfg.deps_of(name).keys().cloned().collect(),
+            required: required.get(name).copied().unwrap_or(config::DepCondition::Started),
+        });
         let name = name.clone();
         let svc = svc.clone();
         let base = base.clone();
@@ -442,34 +543,64 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
             String::new()
         };
         tokio::spawn(async move {
-            runner::run_service(name, svc, base, color, width, shutdown, tx).await;
+            runner::run_service(name, svc, base, color, width, shutdown, tx, Some(startup)).await;
         });
     }
     drop(tx);
 
+    // 第 0 波无依赖，立即触发。
+    for name in &levels[0] {
+        gates[name].notify_one();
+    }
+
+    let mut wave = 0usize;
+    let mut settled: HashSet<String> = HashSet::new();
+    let mut spawned: HashSet<String> = HashSet::new();
+    let mut finished: HashSet<String> = HashSet::new();
     let mut any_failed = false;
     let mut shutting_down = false;
     loop {
         tokio::select! {
             ev = rx.recv() => {
                 match ev {
-                    Some(ServiceEvent::Started { pid }) => {
+                    Some(ServiceEvent::Started { name, pid }) => {
                         pids.lock().unwrap().push(pid);
+                        spawned.insert(name);
                     }
-                    Some(ServiceEvent::Exited { code }) => {
-                        remaining -= 1;
+                    Some(ServiceEvent::Ready { name }) => {
+                        ready.lock().unwrap().insert(name.clone(), true);
+                        settled.insert(name);
+                    }
+                    Some(ServiceEvent::StartFailed { name, error }) => {
+                        runner::print_status(&term::paint("31", &error));
+                        ready.lock().unwrap().insert(name.clone(), false);
+                        settled.insert(name.clone());
+                        finished.insert(name);
+                        any_failed = true;
+                    }
+                    Some(ServiceEvent::Exited { name, code }) => {
+                        finished.insert(name);
                         // 仅显式非零退出码记为失败；停机时被信号终止不计。
                         if matches!(code, Some(c) if c != 0) {
                             any_failed = true;
                         }
                     }
-                    Some(ServiceEvent::Failed) => {
-                        remaining -= 1;
-                        any_failed = true;
-                    }
                     None => break,
                 }
-                if remaining == 0 && !shutting_down {
+                // 当前波全部 settle → 触发下一波。
+                while wave + 1 < levels.len()
+                    && levels[wave].iter().all(|n| settled.contains(n))
+                {
+                    wave += 1;
+                    for name in &levels[wave] {
+                        gates[name].notify_one();
+                    }
+                }
+                // 结束判定：自然退出（全部最终事件）或停机后已启动服务全部结束。
+                if !shutting_down && finished.len() == cfg.services.len() {
+                    break;
+                }
+                if shutting_down && spawned.iter().all(|n| finished.contains(n)) {
                     break;
                 }
             }

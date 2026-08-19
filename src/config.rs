@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,214 @@ pub struct Service {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// 启动前置依赖；本服务在其全部依赖就绪前不启动。
+    #[serde(default)]
+    pub depends_on: Option<DependsOn>,
+    /// 健康检查；被依赖方要求 service_healthy 时在预算内轮询。
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
+}
+
+impl Service {
+    /// 规范化依赖条件：数组简写 `["db"]` 等价 `{"db": {"condition": "service_started"}}`。
+    pub fn depends_on_conditions(&self) -> BTreeMap<String, DepCondition> {
+        match &self.depends_on {
+            None => BTreeMap::new(),
+            Some(DependsOn::List(v)) => v
+                .iter()
+                .map(|s| (s.clone(), DepCondition::Started))
+                .collect(),
+            Some(DependsOn::Map(m)) => m.clone(),
+        }
+    }
+}
+
+/// 依赖条件（对齐 compose 命名，形式为 `{"condition": "service_healthy"}`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DepCondition {
+    /// 进程已 spawn 即视为就绪。
+    Started,
+    /// 健康检查通过才算就绪。
+    Healthy,
+    /// 进程以退出码 0 结束才算就绪（一次性任务，如迁移）。
+    Completed,
+}
+
+impl<'de> Deserialize<'de> for DepCondition {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error as _, MapAccess, Visitor};
+
+        struct CondVisitor;
+        impl<'de> Visitor<'de> for CondVisitor {
+            type Value = DepCondition;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map with a \"condition\" key")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut cond = None;
+                while let Some((k, v)) = map.next_entry::<String, String>()? {
+                    if k == "condition" {
+                        cond = Some(v);
+                    }
+                }
+                match cond.as_deref() {
+                    Some("service_started") => Ok(DepCondition::Started),
+                    Some("service_healthy") => Ok(DepCondition::Healthy),
+                    Some("service_completed_successfully") => Ok(DepCondition::Completed),
+                    Some(other) => Err(A::Error::custom(format!("unknown condition '{other}'"))),
+                    None => Err(A::Error::custom("missing \"condition\" key")),
+                }
+            }
+        }
+
+        d.deserialize_map(CondVisitor)
+    }
+}
+
+impl DepCondition {
+    /// 取更严条件：healthy > completed > started。
+    fn stricter(self, other: DepCondition) -> DepCondition {
+        use DepCondition::*;
+        match (self, other) {
+            (Healthy, _) | (_, Healthy) => Healthy,
+            (Completed, _) | (_, Completed) => Completed,
+            _ => Started,
+        }
+    }
+}
+
+/// `depends_on` 两种写法：数组简写或显式条件 map。
+/// untagged derive 对 seq/map 互不回溯（serde 已知缺陷），故手写 Deserialize。
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum DependsOn {
+    List(Vec<String>),
+    Map(BTreeMap<String, DepCondition>),
+}
+
+impl<'de> Deserialize<'de> for DependsOn {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+
+        struct DependsOnVisitor;
+        impl<'de> Visitor<'de> for DependsOnVisitor {
+            type Value = DependsOn;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of service names or a map of dependency conditions")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(s) = seq.next_element::<String>()? {
+                    v.push(s);
+                }
+                Ok(DependsOn::List(v))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut m = BTreeMap::new();
+                while let Some((k, c)) = map.next_entry::<String, DepCondition>()? {
+                    m.insert(k, c);
+                }
+                Ok(DependsOn::Map(m))
+            }
+        }
+
+        d.deserialize_any(DependsOnVisitor)
+    }
+}
+
+fn default_hc_interval() -> Duration {
+    Duration::from_secs(2)
+}
+
+fn default_hc_timeout() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn default_hc_retries() -> u32 {
+    30
+}
+
+fn default_hc_start_period() -> Duration {
+    Duration::ZERO
+}
+
+/// 健康检查。默认值取 dev 取向（interval 2s / timeout 5s / retries 30），与 compose 不同。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Healthcheck {
+    pub test: String,
+    #[serde(default = "default_hc_interval", deserialize_with = "de_duration")]
+    pub interval: Duration,
+    #[serde(default = "default_hc_timeout", deserialize_with = "de_duration")]
+    pub timeout: Duration,
+    #[serde(default = "default_hc_retries")]
+    pub retries: u32,
+    #[serde(default = "default_hc_start_period", deserialize_with = "de_duration")]
+    pub start_period: Duration,
+}
+
+impl Healthcheck {
+    /// 总等待预算 = start_period + interval × retries。
+    pub fn budget(&self) -> Duration {
+        self.start_period + self.interval * self.retries.max(1)
+    }
+}
+
+fn de_duration<'de, D>(d: D) -> Result<Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    parse_duration(&s).map_err(<D::Error as serde::de::Error>::custom)
+}
+
+/// 解析 compose 风格时长，支持组合："500ms"、"2s"、"1m30s"、"1h"。
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    let chars: Vec<char> = s.trim().chars().collect();
+    let mut total = Duration::ZERO;
+    let mut num = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            i += 1;
+            continue;
+        }
+        if num.is_empty() {
+            return Err(format!("bad duration '{s}'"));
+        }
+        let v: f64 = num
+            .parse()
+            .map_err(|_| format!("bad number in duration '{s}'"))?;
+        let (unit_len, secs) = match c {
+            'h' => (1, v * 3600.0),
+            'm' if i + 1 < chars.len() && chars[i + 1] == 's' => (2, v / 1000.0),
+            'm' => (1, v * 60.0),
+            's' => (1, v),
+            _ => return Err(format!("bad unit in duration '{s}'")),
+        };
+        total += Duration::from_secs_f64(secs);
+        i += unit_len;
+        num.clear();
+    }
+    if !num.is_empty() {
+        return Err(format!("missing unit in duration '{s}'"));
+    }
+    if total.is_zero() {
+        return Err(format!("bad duration '{s}'"));
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -76,7 +285,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// 逐服务校验：command / program 至少提供一个。
+    /// 逐服务校验：command/program 至少一个；依赖存在且无环。
     pub fn validate(&self, path: &Path) -> Result<(), String> {
         for (name, svc) in &self.services {
             if svc.command.is_none() && svc.program.is_none() {
@@ -86,7 +295,85 @@ impl Config {
                 ));
             }
         }
+        self.levels().map_err(|e| format!("{}: {e}", path.display()))?;
+        for (name, cond) in &self.required_conditions() {
+            if *cond == DepCondition::Healthy {
+                let svc = &self.services[name];
+                if svc.healthcheck.is_none() {
+                    return Err(format!(
+                        "{}: service '{name}' is depended on with service_healthy but has no healthcheck",
+                        path.display()
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// 依赖图拓扑分层：无依赖的服务在第 0 波，依赖深度 +1 依次后推；
+    /// 同层服务并行启动。环或未知依赖报错。
+    pub fn levels(&self) -> Result<Vec<Vec<String>>, String> {
+        use std::collections::HashMap;
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Color {
+            White,
+            Gray,
+            Black,
+        }
+
+        fn visit(
+            name: &str,
+            cfg: &Config,
+            color: &mut HashMap<String, Color>,
+            depth: &mut HashMap<String, usize>,
+        ) -> Result<usize, String> {
+            match color.get(name).copied().unwrap_or(Color::White) {
+                Color::Black => return Ok(depth[name]),
+                Color::Gray => return Err(format!("dependency cycle involving '{name}'")),
+                Color::White => {}
+            }
+            color.insert(name.to_string(), Color::Gray);
+            let mut d = 0;
+            for dep in cfg.deps_of(name).keys() {
+                if !cfg.services.contains_key(dep) {
+                    return Err(format!("service '{name}' depends on unknown service '{dep}'"));
+                }
+                d = d.max(visit(dep, cfg, color, depth)? + 1);
+            }
+            color.insert(name.to_string(), Color::Black);
+            depth.insert(name.to_string(), d);
+            Ok(d)
+        }
+
+        let mut color: HashMap<String, Color> = HashMap::new();
+        let mut depth: HashMap<String, usize> = HashMap::new();
+        let mut by_depth: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for name in self.services.keys() {
+            let d = visit(name, self, &mut color, &mut depth)?;
+            by_depth.entry(d).or_default().push(name.clone());
+        }
+        Ok(by_depth.into_values().collect())
+    }
+
+    /// 服务的规范化依赖（BTreeMap 保序）。
+    pub fn deps_of(&self, name: &str) -> BTreeMap<String, DepCondition> {
+        self.services
+            .get(name)
+            .map(|s| s.depends_on_conditions())
+            .unwrap_or_default()
+    }
+
+    /// 每个服务作为依赖需满足的最严条件：healthy > completed > started。
+    pub fn required_conditions(&self) -> BTreeMap<String, DepCondition> {
+        let mut req: BTreeMap<String, DepCondition> = BTreeMap::new();
+        for svc in self.services.values() {
+            for (dep, cond) in svc.depends_on_conditions() {
+                let cur = req.entry(dep).or_insert(DepCondition::Started);
+                *cur = cur.stricter(cond);
+            }
+        }
+        req
     }
 
     /// 所有服务名中最长宽度，用于日志前缀对齐。
@@ -168,6 +455,94 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ydev-test5-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         assert!(discover(&dir).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_duration_units_and_composition() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_duration("1m30s").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        assert!(parse_duration("2").is_err());
+        assert!(parse_duration("xs").is_err());
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn depends_on_both_forms_and_healthcheck_defaults() {
+        let dir = std::env::temp_dir().join(format!("ydev-test6-{}", std::process::id()));
+        let p = write_config(
+            &dir,
+            r#"{
+                "services": {
+                    "db": { "command": "x", "healthcheck": { "test": "true" } },
+                    "web": { "command": "y", "depends_on": ["db"] },
+                    "api": {
+                        "command": "z",
+                        "depends_on": { "db": { "condition": "service_healthy" } }
+                    }
+                }
+            }"#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        // 数组简写 → started；map → healthy
+        assert_eq!(cfg.deps_of("web")["db"], DepCondition::Started);
+        assert_eq!(cfg.deps_of("api")["db"], DepCondition::Healthy);
+        // 最严合并：web 要 started、api 要 healthy → db 需 healthy
+        let req = cfg.required_conditions();
+        assert_eq!(req["db"], DepCondition::Healthy);
+        // healthcheck 默认值
+        let hc = cfg.services["db"].healthcheck.as_ref().unwrap();
+        assert_eq!(hc.interval, Duration::from_secs(2));
+        assert_eq!(hc.timeout, Duration::from_secs(5));
+        assert_eq!(hc.retries, 30);
+        assert_eq!(hc.start_period, Duration::ZERO);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn levels_chain_and_parallel_waves() {
+        let dir = std::env::temp_dir().join(format!("ydev-test7-{}", std::process::id()));
+        let p = write_config(
+            &dir,
+            r#"{
+                "services": {
+                    "a": { "command": "x" },
+                    "b": { "command": "x", "depends_on": ["a"] },
+                    "c": { "command": "x", "depends_on": ["a"] },
+                    "d": { "command": "x", "depends_on": ["b", "c"] }
+                }
+            }"#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let levels = cfg.levels().unwrap();
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0], vec!["a"]);
+        assert_eq!(levels[1], vec!["b", "c"]);
+        assert_eq!(levels[2], vec!["d"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dependency_cycle_and_unknown_dep_are_errors() {
+        let dir = std::env::temp_dir().join(format!("ydev-test8-{}", std::process::id()));
+        let p = write_config(
+            &dir,
+            r#"{
+                "services": {
+                    "a": { "command": "x", "depends_on": ["b"] },
+                    "b": { "command": "x", "depends_on": ["a"] }
+                }
+            }"#,
+        );
+        let err = Config::load(&p).unwrap_err();
+        assert!(err.contains("cycle"), "{err}");
+
+        let p2 = write_config(&dir, r#"{"services": {"a": {"command": "x", "depends_on": ["ghost"]}}}"#);
+        let err2 = Config::load(&p2).unwrap_err();
+        assert!(err2.contains("unknown service 'ghost'"), "{err2}");
         fs::remove_dir_all(&dir).ok();
     }
 }

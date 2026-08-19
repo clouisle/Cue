@@ -1,6 +1,9 @@
 //! 服务进程编排：spawn、日志行流打印、重启策略与进程组信号。
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Notify};
 
-use crate::config::Service;
+use crate::config::{self, Service};
 use crate::term;
 
 /// 重启前固定等待的秒数，避免崩溃热循环。
@@ -18,12 +21,26 @@ const RESTART_DELAY_SECS: u64 = 1;
 
 /// 服务任务 → 主循环事件。
 pub enum ServiceEvent {
-    /// 进程已启动。
-    Started { pid: u32 },
+    /// 进程已启动（每次 spawn 都会发，含重启）。
+    Started { name: String, pid: u32 },
+    /// 服务已就绪（依赖编排中本服务的依赖方可以启动了）。每个服务至多发一次。
+    Ready { name: String },
+    /// 启动失败（spawn 错误或就绪超时/退出非零）。依赖方将跳过。
+    StartFailed { name: String, error: String },
     /// 进程最终退出（不再重启）。`code == None` 表示被信号终止。
-    Exited { code: Option<i32> },
-    /// spawn 失败（视为最终失败，不触发重启策略）。
-    Failed,
+    Exited { name: String, code: Option<i32> },
+}
+
+/// 启动编排上下文：闸门、依赖就绪表、依赖清单与最严就绪条件。
+pub struct Startup {
+    /// 闸门：main 触发后本服务才开始 spawn。
+    pub gate: Arc<Notify>,
+    /// 依赖就绪表（name → 就绪成功与否），main 维护。
+    pub ready: Arc<Mutex<HashMap<String, bool>>>,
+    /// 依赖服务名（启动前逐一检查）。
+    pub deps: Vec<String>,
+    /// 本服务作为依赖需满足的最严条件。
+    pub required: config::DepCondition,
 }
 
 /// 停机信号：置位后唤醒所有等待者。`wait` 在信号到达前挂起。
@@ -183,13 +200,13 @@ pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Ch
 }
 
 /// 后台模式 spawn：stdout/stderr 直接重定向到日志文件（append），stdin null；
-/// 工具退出后服务继续运行。返回进程组组长 pid。
+/// 工具退出后服务继续运行。返回 Child 句柄（持有它可收割退出状态，drop 不杀进程）。
 pub fn spawn_detached(
     name: &str,
     svc: &Service,
     base: &Path,
     log_file: &Path,
-) -> Result<u32, String> {
+) -> Result<std::process::Child, String> {
     let spec = launch_spec(svc);
     let mut cmd = match &spec {
         LaunchSpec::Shell { command } => {
@@ -231,10 +248,13 @@ pub fn spawn_detached(
     let child = cmd
         .spawn()
         .map_err(|e| format!("service '{name}': failed to start: {e}"))?;
-    Ok(child.id())
+    Ok(child)
 }
 
-/// 单个服务的完整生命周期：spawn → 日志流 → 退出 → 按策略重启，直到停机或不再重启。
+/// 单个服务的完整生命周期：等闸门 → spawn → 就绪上报 → 日志流 → 退出 → 按策略重启。
+/// 重启不重查依赖、不重报就绪（依赖编排只约束首轮启动）。
+/// 参数均为任务上下文（名称/配置/展示/信号/事件/编排），聚合为结构体反而增加间接层。
+#[allow(clippy::too_many_arguments)]
 pub async fn run_service(
     name: String,
     svc: Service,
@@ -243,18 +263,50 @@ pub async fn run_service(
     width: usize,
     shutdown: Arc<Shutdown>,
     events: mpsc::Sender<ServiceEvent>,
+    startup: Option<Arc<Startup>>,
 ) {
+    let mut first = true;
     loop {
+        // 首轮：等闸门 + 校验依赖就绪（重启轮次不再等待）。
+        if let Some(s) = &startup
+            && first
+        {
+            s.gate.notified().await;
+            let failed_dep = {
+                let ready_map = s.ready.lock().unwrap();
+                s.deps
+                    .iter()
+                    .find(|dep| ready_map.get(*dep) != Some(&true))
+                    .cloned()
+            };
+            if let Some(dep) = failed_dep {
+                let msg =
+                    format!("service '{name}' skipped: dependency '{dep}' failed to start");
+                let _ = events
+                    .send(ServiceEvent::StartFailed { name: name.clone(), error: msg })
+                    .await;
+                return;
+            }
+        }
+
         let mut child = match spawn_service(&name, &svc, &base) {
             Ok(c) => c,
             Err(e) => {
-                print_status(&term::paint("31", &e));
-                let _ = events.send(ServiceEvent::Failed).await;
+                let _ = events.send(ServiceEvent::StartFailed { name: name.clone(), error: e }).await;
                 return;
             }
         };
         let pid = child.id().unwrap_or(0);
-        let _ = events.send(ServiceEvent::Started { pid }).await;
+        let _ = events.send(ServiceEvent::Started { name: name.clone(), pid }).await;
+
+        // 首轮就绪：started 条件立即满足。
+        let mut settled = false;
+        if let Some(s) = &startup
+            && s.required == config::DepCondition::Started
+        {
+            let _ = events.send(ServiceEvent::Ready { name: name.clone() }).await;
+            settled = true;
+        }
 
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
@@ -262,6 +314,15 @@ pub async fn run_service(
         let t_out = tokio::spawn(read_lines(stdout, line_tx.clone()));
         let t_err = tokio::spawn(read_lines(stderr, line_tx.clone()));
         drop(line_tx);
+
+        // 健康轮询 future（仅首轮且要求 healthy）。
+        let mut health: Option<Pin<Box<dyn Future<Output = bool> + Send>>> = match (&startup, first) {
+            (Some(s), true) if s.required == config::DepCondition::Healthy => {
+                let hc = svc.healthcheck.clone().expect("healthy required implies healthcheck");
+                Some(Box::pin(wait_healthy(hc, &shutdown)))
+            }
+            _ => None,
+        };
 
         // 边跑边打印；`child.wait()` 完成即退出 select。
         let mut wait = std::pin::pin!(child.wait());
@@ -273,6 +334,20 @@ pub async fn run_service(
                         print_line(&name, &color, width, &l);
                     }
                 }
+                healthy = async { health.as_mut().expect("health future").await },
+                    if health.is_some() =>
+                {
+                    if healthy {
+                        let _ = events.send(ServiceEvent::Ready { name: name.clone() }).await;
+                    } else {
+                        let msg = format!("service '{name}' failed health check within budget");
+                        let _ = events
+                            .send(ServiceEvent::StartFailed { name: name.clone(), error: msg })
+                            .await;
+                    }
+                    settled = true;
+                    health = None;
+                }
             }
         };
         // 冲刷 reader 可能残留的部分行，再决定是否重启。
@@ -283,6 +358,30 @@ pub async fn run_service(
         let _ = t_err.await;
 
         let code = status.ok().and_then(|s| s.code());
+
+        // 首轮收尾就绪：healthy/completed 条件按退出码判定。
+        if !settled
+            && first
+            && let Some(s) = &startup
+        {
+            match s.required {
+                config::DepCondition::Healthy | config::DepCondition::Completed => {
+                    if code == Some(0) {
+                        let _ = events.send(ServiceEvent::Ready { name: name.clone() }).await;
+                    } else {
+                        let msg = format!(
+                            "service '{name}' exited (code {}) before becoming ready",
+                            code.map(|c| c.to_string()).unwrap_or_else(|| "signal".into())
+                        );
+                        let _ = events
+                            .send(ServiceEvent::StartFailed { name: name.clone(), error: msg })
+                            .await;
+                    }
+                }
+                config::DepCondition::Started => {}
+            }
+        }
+
         let exit_msg = match code {
             Some(c) => format!("{name} exited with code {c}"),
             None => format!("{name} terminated by signal"),
@@ -290,7 +389,7 @@ pub async fn run_service(
         print_status(&term::dim(&exit_msg));
 
         if shutdown.is_set() || !svc.restart.should_restart(code == Some(0)) {
-            let _ = events.send(ServiceEvent::Exited { code }).await;
+            let _ = events.send(ServiceEvent::Exited { name: name.clone(), code }).await;
             return;
         }
 
@@ -300,8 +399,60 @@ pub async fn run_service(
             _ = shutdown.wait() => {}
         }
         if shutdown.is_set() {
-            let _ = events.send(ServiceEvent::Exited { code }).await;
+            let _ = events.send(ServiceEvent::Exited { name: name.clone(), code }).await;
             return;
+        }
+        first = false;
+    }
+}
+
+/// 单次健康检查：运行 `test`，退出 0 = 健康；超时按失败计。
+pub fn check_healthy_once(test: &str, timeout: Duration) -> bool {
+    let Ok(mut child) = std::process::Command::new(shell_name())
+        .arg(shell_flag())
+        .arg(test)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// 预算内轮询健康检查：成功一次即 true；预算耗尽或停机返回 false。
+pub async fn wait_healthy(hc: config::Healthcheck, shutdown: &Shutdown) -> bool {
+    let deadline = tokio::time::Instant::now() + hc.budget();
+    let mut interval = tokio::time::interval(hc.interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        if shutdown.is_set() {
+            return false;
+        }
+        if check_healthy_once(&hc.test, hc.timeout) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown.wait() => return false,
         }
     }
 }

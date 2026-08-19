@@ -18,4 +18,12 @@
 4. [x] 后台模式集成测试
 5. [x] 全量验证与提交
 
+## yun-dev-manage：依赖编排（depends_on + healthcheck）
+
+1. [x] depends_on / healthcheck 配置模型与 levels 分层（config.rs）
+2. [x] 健康检查轮询与 run_service 就绪改造（runner.rs）
+3. [x] 波次启动与失败传播（main.rs，前后台）
+4. [x] 集成测试与 fixture
+5. [x] 全量验证与提交
+
 See docs/plan/yun-dev-manage.md

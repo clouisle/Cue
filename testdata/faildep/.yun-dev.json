@@ -1,0 +1,17 @@
+{
+  "services": {
+    "db": {
+      "command": "echo db failed; exit 1",
+      "healthcheck": {
+        "test": "false",
+        "interval": "200ms",
+        "retries": 3,
+        "timeout": "1s"
+      }
+    },
+    "backend": {
+      "command": "echo backend up; sleep 5",
+      "depends_on": { "db": { "condition": "service_healthy" } }
+    }
+  }
+}

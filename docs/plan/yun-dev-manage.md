@@ -37,14 +37,16 @@ src/
 
 ```
 前台 up:
-main: 解析 CLI → 发现/加载配置 → 逐个 spawn 服务任务
-每个服务任务: spawn 子进程(新进程组) → 双 reader(stdout/stderr) → mpsc 行流 → 打印线程
-main: select { Ctrl+C, 全部服务退出 }
+main: 解析 CLI → 加载配置 → 拓扑分层（levels）→ 逐波次触发服务 task 的启动闸门
+每个服务 task: 等闸门 → 校验依赖就绪 → spawn 子进程(新进程组) → 双 reader(stdout/stderr) → mpsc 行流 → 打印
+  首轮 spawn 后按最严依赖条件上报就绪：started 立即 / healthy 轮询通过 / completed 退出码 0
+  main 收齐本波次就绪(或失败)后触发下一波次闸门；失败传播：依赖方跳过启动
+main: 全部波次启动完进入 select { Ctrl+C, 全部服务退出 }
   Ctrl+C → 置 shutdown 标志 → 对全部进程组发 SIGTERM → 等 stop-timeout → SIGKILL
   全部退出 → 汇总退出码（任一服务非零码退出=1，否则 0）
 
 后台 up -d / down / logs / ps:
-up -d:   spawn 全部服务（stdout/stderr 重定向到 cache 日志文件，进程组组长）→ 写状态文件 → 退出 0
+up -d:   按波次 spawn（stdout/stderr → cache 日志文件）→ 同步等待本波次就绪 → 写状态文件 → 退出
 ps:      读状态文件 → 按 pid 存活检测 → 打印 running/exited 表
 logs:    读状态文件 → 按需 dump / -f 轮询增量 → 打印带服务名前缀
 down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout → SIGKILL → 删状态文件
@@ -55,16 +57,20 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ```json
 {
   "services": {
+    "db": {
+      "command": "pg_ctl start",
+      "healthcheck": { "test": "pg_isready -h localhost -p 5432", "interval": "2s", "retries": 30 }
+    },
+    "backend": {
+      "command": "cargo run",
+      "depends_on": { "db": { "condition": "service_healthy" } },
+      "restart": "on-failure"
+    },
     "frontend": {
       "command": "bun run dev",
       "cwd": "web",
       "env": { "PORT": "3000" },
-      "restart": "no"
-    },
-    "backend": {
-      "program": "cargo",
-      "args": ["run"],
-      "restart": "on-failure"
+      "depends_on": ["backend"]
     }
   }
 }
@@ -77,6 +83,8 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 - `cwd`: 相对配置文件所在目录（非当前目录），缺省=配置文件目录
 - `env`: 追加覆盖到继承的环境变量
 - `restart`: `no`（默认）| `always` | `on-failure`，重启间隔 1s，停机流程中不重启
+- `depends_on`: 数组简写 `["db"]`（等价 `service_started`）或 map 形式 `{"db": {"condition": "service_healthy" | "service_started" | "service_completed_successfully"}}`；依赖服务就绪前本服务不启动，按最长依赖链分层（波次）并行启动
+- `healthcheck`: `{"test": 命令, "interval": "2s", "timeout": "5s", "retries": 30, "start_period": "0s"}`；test 退出 0 = 健康。默认值与 compose 不同（dev 取向：interval 2s / timeout 5s / retries 30），等待预算 = start_period + interval × retries，预算内成功一次即就绪。时间格式支持 `500ms`/`2s`/`1m30s` 组合
 
 ## Implementation Plan
 
@@ -132,6 +140,15 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
   - `logs [--follow] [--tail N] [service...]`: 默认 dump 全部历史；`--follow` 每 200ms 轮询增量（记录字节偏移）；`--tail N` 从倒数第 N 行开始；每行带服务名彩色前缀（`-f` 为全局 `--file`，故 follow 无短标志）
   - 后台 spawn 用 std::process（Child drop 不杀进程，工具退出后服务继续跑）；`runner::print_line` 提为 pub 供 logs 复用
 - **Validation**: 集成测试：up -d → ps 显示 running → logs 含前缀历史 → -f 捕获追加行 → 重复 up -d 报错 → 前台 up 报错 → down 清 state
+
+### Stage 7: 依赖编排（depends_on + healthcheck）
+- **Files modified**: `src/config.rs`、`src/runner.rs`、`src/main.rs`
+- **Specific logic**:
+  - config: `DependsOn`（untagged：数组=started / map=显式条件）、`Healthcheck`（test/interval/timeout/retries/start_period，时间字符串经 `parse_duration` 解析，支持 `500ms`/`2s`/`1m30s`）；`Config::levels()` 拓扑分层（DFS 环检测 + 最长依赖链深度），`required_condition()` 按依赖方求最严条件（healthy > completed > started）
+  - runner: `check_healthy_once`（单次 test，std 同步，含单次 timeout）；`wait_healthy`（async 预算 = start_period + interval×retries，内置 shutdown）；`run_service` 增加闸门（`Notify`）、依赖就绪表（`Arc<Mutex<HashMap<name,bool>>>`）与首轮就绪上报（started 立即 / healthy 在 select 中并行轮询 / completed 按退出码）
+  - main: 前台按波次触发闸门（settle 事件收齐推进下一波），失败传播（依赖 failed → 依赖方跳过并标记 failed）；后台 `up -d` 同步波次 + 同步就绪等待后写 state
+  - 语义注记：重启不重查依赖（文档注明）；healthy 与 completed 被同时要求时以 healthy 优先（边缘，文档注明）
+- **Validation**: 单元（untagged 解析/环/缺依赖/分层/parse_duration/check_healthy_once）+ 集成（启动顺序断言、健康超时失败传播、completed 条件）
 
 ## Testing Strategy
 - Happy path: 多服务交错日志、前缀与着色、自然退出码汇总

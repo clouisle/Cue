@@ -1,0 +1,27 @@
+{
+  "services": {
+    "migrate": {
+      "command": "sleep 0.2; echo migrated; exit 0"
+    },
+    "db": {
+      "command": "echo db up; touch /tmp/ydev-order-db-ready; sleep 5",
+      "healthcheck": {
+        "test": "test -f /tmp/ydev-order-db-ready",
+        "interval": "200ms",
+        "retries": 20
+      }
+    },
+    "backend": {
+      "command": "echo backend started; sleep 5",
+      "depends_on": { "db": { "condition": "service_healthy" } }
+    },
+    "app": {
+      "command": "echo app up; sleep 5",
+      "depends_on": { "migrate": { "condition": "service_completed_successfully" } }
+    },
+    "frontend": {
+      "command": "echo frontend started; sleep 5",
+      "depends_on": ["backend"]
+    }
+  }
+}
