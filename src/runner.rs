@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Child;
 use tokio::sync::{mpsc, Notify};
 
-use crate::config::{self, Service};
+use crate::config::{self, parse_env_file, Service};
 use crate::term;
 
 /// 重启前固定等待的秒数，避免崩溃热循环。
@@ -166,6 +166,25 @@ pub(crate) fn resolve_cwd(
     Ok(cwd)
 }
 
+/// 读取 env_file 键值（相对配置目录）；env map 随后覆盖同名键。
+fn env_file_entries(
+    name: &str,
+    svc: &Service,
+    base: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    if let Some(ef) = &svc.env_file {
+        for f in ef.files() {
+            let p = base.join(f);
+            let content = std::fs::read_to_string(&p).map_err(|e| {
+                format!("service '{name}': cannot read env_file {}: {e}", p.display())
+            })?;
+            entries.extend(parse_env_file(&content));
+        }
+    }
+    Ok(entries)
+}
+
 /// 按配置 spawn 一个服务；unix 下子进程成为新进程组组长（`process_group(0)`），
 /// 便于对整棵进程树发信号。
 pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Child, String> {
@@ -189,6 +208,9 @@ pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Ch
     }
 
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env_file_entries(name, svc, base)? {
+        cmd.env(k, v);
+    }
     for (k, v) in &svc.env {
         cmd.env(k, v);
     }
@@ -235,6 +257,9 @@ pub fn spawn_detached(
         .try_clone()
         .map_err(|e| format!("service '{name}': cannot clone log handle: {e}"))?;
     cmd.stdin(Stdio::null()).stdout(Stdio::from(file_err)).stderr(Stdio::from(file));
+    for (k, v) in env_file_entries(name, svc, base)? {
+        cmd.env(k, v);
+    }
     for (k, v) in &svc.env {
         cmd.env(k, v);
     }

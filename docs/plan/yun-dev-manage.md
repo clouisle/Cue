@@ -67,9 +67,10 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
       "restart": "on-failure"
     },
     "frontend": {
-      "command": "bun run dev",
+      "command": "bun run dev --port ${PORT}",
       "cwd": "web",
-      "env": { "PORT": "3000" },
+      "env_file": "web/.env",
+      "env": { "API_URL": "http://localhost:${PORT}" },
       "depends_on": ["backend"]
     }
   }
@@ -82,6 +83,9 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 - `program` + `args`: 直接 exec，不经过 shell；与 `command` 二选一（都缺省=校验错误）
 - `cwd`: 相对配置文件所在目录（非当前目录），缺省=配置文件目录
 - `env`: 追加覆盖到继承的环境变量
+- `env_file`: 字符串或数组，加载 KEY=VALUE 文件注入进程环境（`#` 注释、空行、无值 KEY、引号剥离）；优先级：继承 < env_file < env
+- 变量插值：配置内 `${VAR}` / `${VAR:-默认}` / `${VAR-默认}`，应用于 command / program / args / cwd / env 值 / healthcheck.test；查找顺序 shell 环境 > 配置文件目录 `.env` > 默认值；`env_file` 文件不参与插值（仅注入进程）
+- 裸 `$VAR` 原样保留给运行时 shell 展开（命令中的 `$i`、`$HOME` 不被吞；与 compose 的"插值裸形式"有意不同）；`$$` 转义为字面 `$`
 - `restart`: `no`（默认）| `always` | `on-failure`，重启间隔 1s，停机流程中不重启
 - `depends_on`: 数组简写 `["db"]`（等价 `service_started`）或 map 形式 `{"db": {"condition": "service_healthy" | "service_started" | "service_completed_successfully"}}`；依赖服务就绪前本服务不启动，按最长依赖链分层（波次）并行启动
 - `healthcheck`: `{"test": 命令, "interval": "2s", "timeout": "5s", "retries": 30, "start_period": "0s"}`；test 退出 0 = 健康。默认值与 compose 不同（dev 取向：interval 2s / timeout 5s / retries 30），等待预算 = start_period + interval × retries，预算内成功一次即就绪。时间格式支持 `500ms`/`2s`/`1m30s` 组合
@@ -149,6 +153,15 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
   - main: 前台按波次触发闸门（settle 事件收齐推进下一波），失败传播（依赖 failed → 依赖方跳过并标记 failed）；后台 `up -d` 同步波次 + 同步就绪等待后写 state
   - 语义注记：重启不重查依赖（文档注明）；healthy 与 completed 被同时要求时以 healthy 优先（边缘，文档注明）
 - **Validation**: 单元（untagged 解析/环/缺依赖/分层/parse_duration/check_healthy_once）+ 集成（启动顺序断言、健康超时失败传播、completed 条件）
+
+### Stage 8: 变量插值（.env / env_file）
+- **Files modified**: `src/config.rs`、`src/runner.rs`
+- **Specific logic**:
+  - `parse_env_file`: 每行 `KEY=VALUE`（`#` 注释、空行、无值 KEY、首尾引号剥离）
+  - `interpolate`: 状态机扫描 `${VAR}`/`${VAR:-def}`/`${VAR-def}` 与 `$$` 转义；**裸 `$VAR` 保留给运行时 shell 展开**（避免吞掉命令中的 `$i`/`$HOME`，有意偏离 compose 的裸形式插值）；查找顺序 shell 环境 > 配置目录 `.env` > 默认值
+  - `Config::load` 在 parse 后 resolve：对 command/program/args/cwd/env 值/healthcheck.test 插值，再 validate
+  - `EnvFile`（untagged：字符串或数组，手写 visitor）；spawn_service/spawn_detached 在 env map 之前注入 env_file 键值（env 覆盖 env_file）
+- **Validation**: 单元（parse_env_file/interpolate 各语法）+ 集成（fixture 验证 command 插值、env_file 注入、默认值、shell 环境直通）
 
 ## Testing Strategy
 - Happy path: 多服务交错日志、前缀与着色、自然退出码汇总

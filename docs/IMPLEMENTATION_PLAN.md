@@ -26,4 +26,11 @@
 4. [x] 集成测试与 fixture
 5. [x] 全量验证与提交
 
+## yun-dev-manage：变量插值（.env / env_file）
+
+1. [x] 插值器 + .env 加载 + env_file 解析（config.rs）
+2. [x] env_file 注入进程环境（runner.rs）
+3. [x] 集成测试与 fixture
+4. [x] 全量验证与提交
+
 See docs/plan/yun-dev-manage.md

@@ -1,0 +1,9 @@
+{
+  "services": {
+    "web": {
+      "command": "echo interp port=${PORT} token=${TOKEN:-nope}; echo injected token=$TOKEN file=$FROM_FILE map=$FROM_MAP; sleep 5",
+      "env_file": "svc.env",
+      "env": { "TOKEN": "overridden", "FROM_MAP": "yes" }
+    }
+  }
+}

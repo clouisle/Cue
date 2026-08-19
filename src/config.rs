@@ -57,6 +57,9 @@ pub struct Service {
     /// 追加覆盖到继承的环境变量。
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// KEY=VALUE 文件（字符串或数组），相对配置文件目录；env 字段覆盖其值。
+    #[serde(default)]
+    pub env_file: Option<EnvFile>,
     #[serde(default)]
     pub restart: RestartPolicy,
     /// 启动前置依赖；本服务在其全部依赖就绪前不启动。
@@ -230,6 +233,156 @@ where
     parse_duration(&s).map_err(<D::Error as serde::de::Error>::custom)
 }
 
+/// `env_file`：字符串或路径数组。手写 Deserialize 避免 untagged 容器回溯缺陷。
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum EnvFile {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl EnvFile {
+    pub fn files(&self) -> Vec<&str> {
+        match self {
+            EnvFile::One(f) => vec![f.as_str()],
+            EnvFile::Many(v) => v.iter().map(|s| s.as_str()).collect(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvFile {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{SeqAccess, Visitor};
+
+        struct EnvFileVisitor;
+        impl<'de> Visitor<'de> for EnvFileVisitor {
+            type Value = EnvFile;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a file path or an array of file paths")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+                Ok(EnvFile::One(s.to_string()))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(s) = seq.next_element::<String>()? {
+                    v.push(s);
+                }
+                Ok(EnvFile::Many(v))
+            }
+        }
+
+        d.deserialize_any(EnvFileVisitor)
+    }
+}
+
+/// 解析 KEY=VALUE 文件内容：`#` 注释、空行、无值 KEY、首尾引号剥离。
+pub fn parse_env_file(content: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            if !key.is_empty() {
+                map.insert(key.to_string(), unquote(v.trim()));
+            }
+        } else {
+            // 无 `=`：KEY 视为空值。
+            map.insert(line.to_string(), String::new());
+        }
+    }
+    map
+}
+
+fn unquote(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+        || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// 变量插值：`${VAR}` / `${VAR:-默认}` / `${VAR-默认}` / `$$` 转义字面 `$`。
+/// 裸 `$VAR` 原样保留——交给运行时 shell 展开（命令中的 `$i`、`$HOME` 等
+/// shell 变量不被吞掉；与 compose 不同，后者会插值裸形式）。
+pub fn interpolate(input: &str, vars: &BTreeMap<String, String>) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' || i + 1 >= chars.len() {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if chars[i + 1] == '$' {
+            out.push('$');
+            i += 2;
+            continue;
+        }
+        if chars[i + 1] == '{' {
+            let rest = &chars[i + 2..];
+            match rest.iter().position(|&c| c == '}') {
+                Some(rel) => {
+                    let inner: String = rest[..rel].iter().collect();
+                    out.push_str(&resolve_var(&inner, vars));
+                    i += 2 + rel + 1;
+                }
+                None => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            // 裸 $VAR：原样保留（运行时 shell 展开）。
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn resolve_var(inner: &str, vars: &BTreeMap<String, String>) -> String {
+    if let Some((name, default)) = inner.split_once(":-") {
+        let v = vars.get(name.trim()).map(String::as_str).unwrap_or("");
+        if v.is_empty() {
+            default.to_string()
+        } else {
+            v.to_string()
+        }
+    } else if let Some((name, default)) = inner.split_once('-') {
+        vars.get(name.trim())
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
+    } else {
+        vars.get(inner.trim()).cloned().unwrap_or_default()
+    }
+}
+
+/// 插值变量表：shell 环境优先，配置目录 `.env` 兜底。
+fn env_vars_with_dotenv(config_dir: &Path) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    if let Ok(content) = std::fs::read_to_string(config_dir.join(".env")) {
+        vars.extend(parse_env_file(&content));
+    }
+    for (k, v) in std::env::vars() {
+        vars.insert(k, v);
+    }
+    vars
+}
+
 /// 解析 compose 风格时长，支持组合："500ms"、"2s"、"1m30s"、"1h"。
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let chars: Vec<char> = s.trim().chars().collect();
@@ -275,14 +428,36 @@ pub struct Config {
 }
 
 impl Config {
-    /// 读取并校验配置文件；错误消息带路径上下文。
+    /// 读取、插值并校验配置文件；错误消息带路径上下文。
     pub fn load(path: &Path) -> Result<Config, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        let cfg: Config = serde_json::from_str(&raw)
+        let mut cfg: Config = serde_json::from_str(&raw)
             .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+        let vars = env_vars_with_dotenv(path.parent().unwrap_or(Path::new(".")));
+        cfg.resolve(&vars);
         cfg.validate(path)?;
         Ok(cfg)
+    }
+
+    /// 对 command / program / args / cwd / env 值 / healthcheck.test 应用变量插值。
+    pub fn resolve(&mut self, vars: &BTreeMap<String, String>) {
+        for svc in self.services.values_mut() {
+            svc.command = svc.command.as_deref().map(|s| interpolate(s, vars));
+            svc.program = svc.program.as_deref().map(|s| interpolate(s, vars));
+            for a in &mut svc.args {
+                *a = interpolate(a, vars);
+            }
+            svc.cwd = svc.cwd.as_deref().and_then(|p| {
+                p.to_str().map(|s| PathBuf::from(interpolate(s, vars)))
+            });
+            for v in svc.env.values_mut() {
+                *v = interpolate(v, vars);
+            }
+            if let Some(hc) = &mut svc.healthcheck {
+                hc.test = interpolate(&hc.test, vars);
+            }
+        }
     }
 
     /// 逐服务校验：command/program 至少一个；依赖存在且无环。
@@ -543,6 +718,70 @@ mod tests {
         let p2 = write_config(&dir, r#"{"services": {"a": {"command": "x", "depends_on": ["ghost"]}}}"#);
         let err2 = Config::load(&p2).unwrap_err();
         assert!(err2.contains("unknown service 'ghost'"), "{err2}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interpolate_supports_all_syntaxes() {
+        let mut vars = BTreeMap::new();
+        vars.insert("PORT".to_string(), "8080".to_string());
+        vars.insert("EMPTY".to_string(), String::new());
+
+        assert_eq!(interpolate("a${PORT}b", &vars), "a8080b");
+        assert_eq!(interpolate("$PORT", &vars), "$PORT", "裸 $VAR 保留给运行时 shell");
+        assert_eq!(interpolate("${MISSING}", &vars), "");
+        assert_eq!(interpolate("${MISSING:-def}", &vars), "def");
+        assert_eq!(interpolate("${EMPTY:-def}", &vars), "def", ":- 覆盖空值");
+        assert_eq!(interpolate("${EMPTY-def}", &vars), "", "- 不覆盖空值");
+        assert_eq!(interpolate("${PORT:-def}", &vars), "8080");
+        assert_eq!(interpolate("no vars here", &vars), "no vars here");
+        assert_eq!(interpolate("$${PORT}", &vars), "${PORT}", "$$ 转义为字面 $");
+        assert_eq!(interpolate("${UNCLOSED", &vars), "${UNCLOSED");
+    }
+
+    #[test]
+    fn parse_env_file_handles_comments_quotes_and_empty() {
+        let content = "# comment\n\nKEY=value\nQUOTED=\"a b\"\nSINGLE='x'\nBARE\nEMPTY=\n";
+        let map = parse_env_file(content);
+        assert_eq!(map["KEY"], "value");
+        assert_eq!(map["QUOTED"], "a b");
+        assert_eq!(map["SINGLE"], "x");
+        assert_eq!(map["BARE"], "");
+        assert_eq!(map["EMPTY"], "");
+        assert!(!map.contains_key("# comment"));
+    }
+
+    #[test]
+    fn load_applies_dotenv_interpolation_and_env_file() {
+        let dir = std::env::temp_dir().join(format!("ydev-test9-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(".env"),
+            "PORT=8080\nTOKEN=secret\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("svc.env"),
+            "FROM_FILE=yes\n",
+        )
+        .unwrap();
+        let p = write_config(
+            &dir,
+            r#"{
+                "services": {
+                    "web": {
+                        "command": "echo ${PORT} ${TOKEN} ${MISSING:-none}",
+                        "env_file": "svc.env",
+                        "env": { "URL": "http://x:${PORT}" }
+                    }
+                }
+            }"#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let web = &cfg.services["web"];
+        assert_eq!(web.command.as_deref(), Some("echo 8080 secret none"));
+        assert_eq!(web.env["URL"], "http://x:8080");
+        assert!(matches!(web.env_file, Some(EnvFile::One(ref f)) if f == "svc.env"));
         fs::remove_dir_all(&dir).ok();
     }
 }
