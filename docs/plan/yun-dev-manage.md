@@ -26,8 +26,9 @@
 
 ```
 src/
-  main.rs    CLI 入口（clap derive）：up / config / validate；信号处理与退出码汇总
+  main.rs    CLI 入口（clap derive）：up(-d) / down / logs / ps / config / validate；信号处理与退出码汇总
   config.rs  .yun-dev.json 模型（serde）、自动发现（向上逐级查找）、校验
+  session.rs 后台会话状态文件（cache 目录、pid/日志路径记录、存活检测）
   runner.rs  服务进程 spawn、日志行流读取与打印、重启策略、进程组信号
   term.rs    ANSI 颜色调色板、前缀格式化
 ```
@@ -35,11 +36,18 @@ src/
 ### 数据流
 
 ```
+前台 up:
 main: 解析 CLI → 发现/加载配置 → 逐个 spawn 服务任务
 每个服务任务: spawn 子进程(新进程组) → 双 reader(stdout/stderr) → mpsc 行流 → 打印线程
 main: select { Ctrl+C, 全部服务退出 }
   Ctrl+C → 置 shutdown 标志 → 对全部进程组发 SIGTERM → 等 stop-timeout → SIGKILL
   全部退出 → 汇总退出码（任一服务非零码退出=1，否则 0）
+
+后台 up -d / down / logs / ps:
+up -d:   spawn 全部服务（stdout/stderr 重定向到 cache 日志文件，进程组组长）→ 写状态文件 → 退出 0
+ps:      读状态文件 → 按 pid 存活检测 → 打印 running/exited 表
+logs:    读状态文件 → 按需 dump / -f 轮询增量 → 打印带服务名前缀
+down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout → SIGKILL → 删状态文件
 ```
 
 ### 配置格式 `.yun-dev.json`
@@ -112,6 +120,18 @@ main: select { Ctrl+C, 全部服务退出 }
   - 集成测试：以 fixture 为 cwd 启动二进制 → 断言输出含 `frontend  | ` 前缀 → 对二进制发 SIGINT → 断言优雅退出且退出码为 1（worker 失败）且输出含 `exited with code`
   - 冒烟：真实终端手动运行一次观察配色
 - **Validation**: `cargo test` 全绿；`cargo clippy -- -D warnings` 通过
+
+### Stage 6: 后台模式（up -d / down / logs / ps）
+- **Files modified**: `src/session.rs`（新增）、`src/runner.rs`、`src/main.rs`
+- **Specific logic**:
+  - 状态文件：`$XDG_CACHE_HOME/yun-dev-manage/<config路径hash>/state.json`（fallback `~/.cache`），记录 `version`、`config_path`、每服务 `{name, pid, log}`；日志文件同目录 `<name>.log`，append 打开
+  - `up -d`: 复用 `launch_spec`（command/program 二选一，与前台共享）→ std::process::Command spawn，`process_group(0)`，stdin null、stdout/stderr → 日志文件；spawn 全部后写 state（写失败则 SIGTERM 已起服务并报错）；打印提示（logs/ps/down 用法）；任一 spawn 失败 → 1
+  - 前后台互斥：前台 `up` 与 `up -d` 启动前检测 state 中是否有存活 pid → 有则报错提示先 `down`
+  - `down`: 对运行中进程组 SIGTERM → 轮询等 stop-timeout → SIGKILL → 删 state（日志文件保留）
+  - `ps`: 表格输出 name / pid / running|exited / log 路径；`is_alive` = `kill(pid, 0)`（ESRCH=死，EPERM=活）
+  - `logs [--follow] [--tail N] [service...]`: 默认 dump 全部历史；`--follow` 每 200ms 轮询增量（记录字节偏移）；`--tail N` 从倒数第 N 行开始；每行带服务名彩色前缀（`-f` 为全局 `--file`，故 follow 无短标志）
+  - 后台 spawn 用 std::process（Child drop 不杀进程，工具退出后服务继续跑）；`runner::print_line` 提为 pub 供 logs 复用
+- **Validation**: 集成测试：up -d → ps 显示 running → logs 含前缀历史 → -f 捕获追加行 → 重复 up -d 报错 → 前台 up 报错 → down 清 state
 
 ## Testing Strategy
 - Happy path: 多服务交错日志、前缀与着色、自然退出码汇总

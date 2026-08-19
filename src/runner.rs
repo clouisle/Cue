@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::{mpsc, Notify};
 
 use crate::config::Service;
@@ -79,8 +79,8 @@ async fn read_lines<R: AsyncRead + Unpin>(r: R, tx: mpsc::Sender<Line>) {
     }
 }
 
-/// 带服务名前缀的日志行输出。
-fn print_line(name: &str, color: &str, width: usize, line: &Line) {
+/// 带服务名前缀的日志行输出（前台日志流与后台 logs 共用）。
+pub fn print_line(name: &str, color: &str, width: usize, line: &Line) {
     use std::io::Write;
     let text = line.text.trim_end_matches(['\n', '\r']);
     let mut out = std::io::stdout().lock();
@@ -96,23 +96,41 @@ pub fn print_status(s: &str) {
     let _ = out.flush();
 }
 
-/// 按配置 spawn 一个服务；unix 下子进程成为新进程组组长（`process_group(0)`），
-/// 便于对整棵进程树发信号。
-pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Child, String> {
-    let mut cmd = match &svc.program {
-        Some(program) => {
-            let mut c = Command::new(program);
-            c.args(&svc.args);
-            c
-        }
-        None => {
-            let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
-            let mut c = Command::new(shell);
-            c.arg(flag).arg(svc.command.as_deref().unwrap_or_default());
-            c
-        }
-    };
+/// 启动方式：shell 命令或直接 exec；前台/后台共用。
+pub(crate) enum LaunchSpec {
+    Shell { command: String },
+    Direct { program: String, args: Vec<String> },
+}
 
+pub(crate) fn launch_spec(svc: &Service) -> LaunchSpec {
+    match &svc.program {
+        Some(program) => LaunchSpec::Direct { program: program.clone(), args: svc.args.clone() },
+        None => LaunchSpec::Shell { command: svc.command.clone().unwrap_or_default() },
+    }
+}
+
+fn shell_name() -> &'static str {
+    if cfg!(windows) {
+        "cmd"
+    } else {
+        "sh"
+    }
+}
+
+fn shell_flag() -> &'static str {
+    if cfg!(windows) {
+        "/C"
+    } else {
+        "-c"
+    }
+}
+
+/// 解析并校验 cwd（相对配置目录），返回绝对路径。
+pub(crate) fn resolve_cwd(
+    name: &str,
+    svc: &Service,
+    base: &Path,
+) -> Result<Option<PathBuf>, String> {
     let cwd = svc.cwd.as_ref().map(|c| {
         if c.is_absolute() {
             c.clone()
@@ -120,13 +138,36 @@ pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Ch
             base.join(c)
         }
     });
-    if let Some(cwd) = &cwd {
-        if !cwd.is_dir() {
-            return Err(format!(
-                "service '{name}': working directory '{}' does not exist",
-                cwd.display()
-            ));
+    if let Some(cwd) = &cwd
+        && !cwd.is_dir()
+    {
+        return Err(format!(
+            "service '{name}': working directory '{}' does not exist",
+            cwd.display()
+        ));
+    }
+    Ok(cwd)
+}
+
+/// 按配置 spawn 一个服务；unix 下子进程成为新进程组组长（`process_group(0)`），
+/// 便于对整棵进程树发信号。
+pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Child, String> {
+    let spec = launch_spec(svc);
+    let mut cmd = match &spec {
+        LaunchSpec::Shell { command } => {
+            let mut c = tokio::process::Command::new(shell_name());
+            c.arg(shell_flag()).arg(command);
+            c
         }
+        LaunchSpec::Direct { program, args } => {
+            let mut c = tokio::process::Command::new(program);
+            c.args(args);
+            c
+        }
+    };
+
+    let cwd = resolve_cwd(name, svc, base)?;
+    if let Some(cwd) = &cwd {
         cmd.current_dir(cwd);
     }
 
@@ -139,6 +180,58 @@ pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Ch
     cmd.process_group(0);
 
     cmd.spawn().map_err(|e| format!("service '{name}': failed to start: {e}"))
+}
+
+/// 后台模式 spawn：stdout/stderr 直接重定向到日志文件（append），stdin null；
+/// 工具退出后服务继续运行。返回进程组组长 pid。
+pub fn spawn_detached(
+    name: &str,
+    svc: &Service,
+    base: &Path,
+    log_file: &Path,
+) -> Result<u32, String> {
+    let spec = launch_spec(svc);
+    let mut cmd = match &spec {
+        LaunchSpec::Shell { command } => {
+            let mut c = std::process::Command::new(shell_name());
+            c.arg(shell_flag()).arg(command);
+            c
+        }
+        LaunchSpec::Direct { program, args } => {
+            let mut c = std::process::Command::new(program);
+            c.args(args);
+            c
+        }
+    };
+
+    let cwd = resolve_cwd(name, svc, base)?;
+    if let Some(cwd) = &cwd {
+        cmd.current_dir(cwd);
+    }
+
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .map_err(|e| format!("service '{name}': cannot open log {}: {e}", log_file.display()))?;
+    let file_err = file
+        .try_clone()
+        .map_err(|e| format!("service '{name}': cannot clone log handle: {e}"))?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(file_err)).stderr(Stdio::from(file));
+    for (k, v) in &svc.env {
+        cmd.env(k, v);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("service '{name}': failed to start: {e}"))?;
+    Ok(child.id())
 }
 
 /// 单个服务的完整生命周期：spawn → 日志流 → 退出 → 按策略重启，直到停机或不再重启。
