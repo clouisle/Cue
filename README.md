@@ -7,7 +7,8 @@
 - **自动发现**：从当前目录向上逐级查找最近的 `.yun-dev.json`，任意子目录运行即可
 - **compose 风格日志**：每服务独立彩色前缀（`frontend  | ...`）、stdout/stderr 合并行流、无换行残留输出退出时冲刷
 - **依赖编排**：`depends_on` + `healthcheck`，按最长依赖链分层启动，依赖未就绪下游不启动
-- **后台模式**：`up -d` 脱离终端运行，`ps` / `logs` / `down` 随时管理
+- **后台模式**：`up -d` 脱离终端运行，`ps` / `restart` / `logs` / `down` 随时管理
+- **服务定向管理**：`up [SERVICE...]` 自动包含传递依赖；`restart [SERVICE...]` 重启后台会话中的指定服务；`logs -f [SERVICE...]` 实时跟随指定服务
 - **优雅停机**：Ctrl+C 一次 SIGTERM（整进程树），超时 SIGKILL，二次强制；SIGTERM 同路径
 - **变量插值**：`${VAR}` / `${VAR:-默认}`，来源 shell 环境 + 项目 `.env`；`env_file` 注入进程环境
 - **重启策略**：`no` / `always` / `on-failure`（间隔 1s 防热循环）
@@ -91,24 +92,30 @@ yun-dev-manage              # 读取 .yun-dev.json，拉起全部服务
 yun-dev-manage [OPTIONS] [COMMAND]
 
 Commands:
-  up        Start all services and stream their logs (default command)
-  up -d     Run in the background; manage with ps / logs / down
-  ps        List background session services and status
-  logs      Print background logs [--follow] [--tail N] [service...]
-  down      Stop background session (SIGTERM -> timeout -> SIGKILL)
-  config    Print the resolved configuration as JSON
-  validate  Validate the configuration only
+  up [--detach] [SERVICE]...  Start selected services and their dependencies (default: all)
+  restart [SERVICE]...        Restart background session services (default: all)
+  ps                          List background session services and status
+  logs                        Print background logs [-f|--follow] [--tail N] [SERVICE]...
+  down                        Stop background session (SIGTERM -> timeout -> SIGKILL)
+  config                      Print the resolved configuration as JSON
+  validate                    Validate the configuration only
 
 Options:
-  -f, --file <FILE>          指定配置文件（默认向上发现 .yun-dev.json）
+      --file <FILE>          指定配置文件（默认向上发现 `.yun-dev.json`）
       --no-color             关闭彩色输出
       --stop-timeout <SECS>  优雅停机等待秒数，0 = 立即强制 [default: 10]
 ```
 
+### 服务选择与后台管理
+
+- `up [SERVICE...]` 和 `up -d [SERVICE...]` 只启动指定服务及其传递 `depends_on` 依赖；未选中的无关服务不会启动。未知服务名会在启动前报错。
+- `restart [SERVICE...]` 只针对现有后台会话中的服务；省略名称则重启会话内全部服务。每个目标先按 `--stop-timeout` 优雅停止，必要时 SIGKILL，再以当前配置和原日志文件启动；已退出的会话服务直接启动。
+- `logs [SERVICE...]` 输出所选服务的历史日志；`logs -f [SERVICE...]`（`--follow` 同义）仅跟随所选服务。`-f` 现在保留给日志跟随，配置路径使用长选项 `--file`。
+
 ### 行为细节
 
 - **退出码**：任一服务以非零码退出 → 1（自然退出或停机后汇总）；停机时被信号终止的服务不计失败
-- **前后台互斥**：后台会话运行中时，前台 `up` 与 `up -d` 拒绝启动
+- **前后台互斥**：后台会话运行中时，前台 `up` 与 `up -d` 拒绝启动；`restart` 仅操作已有后台会话
 - **会话状态**：`$XDG_CACHE_HOME/yun-dev-manage/<配置路径hash>/`（fallback `~/.cache`），含 `state.json` 与每服务日志文件；`down` 只清状态，日志保留
 - **依赖失败传播**：依赖启动失败（spawn 错误/健康超时/退出非零）→ 依赖方跳过启动，会话退出码 1
 - **颜色开关**：TTY + 无 `NO_COLOR` + 无 `--no-color`

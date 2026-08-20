@@ -92,6 +92,20 @@ pub fn is_alive(pid: u32) -> bool {
     false
 }
 
+/// `pid` 在 `timeout` 内退出则返回 true（轮询 50ms）。
+pub fn wait_exited(pid: u32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !is_alive(pid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return !is_alive(pid);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 impl Session {
     /// 是否有至少一个服务存活。
     pub fn is_any_running(&self) -> bool {

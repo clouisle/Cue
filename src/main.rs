@@ -3,7 +3,7 @@ mod runner;
 mod session;
 mod term;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,7 +22,7 @@ use runner::{ServiceEvent, SharedPids, Shutdown, signal_all};
 )]
 struct Cli {
     /// Path to the config file (default: nearest .yun-dev.json found upward from cwd)
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     file: Option<PathBuf>,
 
     /// Disable colored output
@@ -39,8 +39,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Start all services and stream their logs (default command)
+    /// Start selected services and stream their logs (default: all)
     Up(UpArgs),
+    /// Restart background service(s)
+    Restart(RestartArgs),
     /// Stop the background session (SIGTERM -> timeout -> SIGKILL)
     Down,
     /// Print or follow background session logs
@@ -58,12 +60,22 @@ struct UpArgs {
     /// Run in the background; manage with ps / logs / down
     #[arg(short, long)]
     detach: bool,
+    /// Service name(s) to start, including their dependencies (default: all)
+    #[arg(value_name = "SERVICE")]
+    services: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct RestartArgs {
+    /// Background service name(s) to restart (default: all)
+    #[arg(value_name = "SERVICE")]
+    services: Vec<String>,
 }
 
 #[derive(clap::Args)]
 struct LogsArgs {
-    /// Follow new output (no short flag: -f is the global --file)
-    #[arg(long)]
+    /// Follow new output
+    #[arg(short = 'f', long)]
     follow: bool,
     /// Show only the last N lines (0 = only new output when following)
     #[arg(long)]
@@ -96,7 +108,10 @@ async fn main() {
 
     // Down / Logs / Ps 只依赖配置文件路径定位会话，不解析配置内容，
     // 避免配置损坏后无法停止已后台运行的服务。
-    let command = cli.command.unwrap_or(Command::Up(UpArgs { detach: false }));
+    let command = cli.command.unwrap_or(Command::Up(UpArgs {
+        detach: false,
+        services: Vec::new(),
+    }));
     let code = match command {
         Command::Up(args) => {
             let cfg = match Config::load(&cfg_path) {
@@ -106,14 +121,32 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Err(e) = check_no_running_session(&cfg_path) {
-                eprintln!("error: {e}");
-                1
-            } else if args.detach {
-                up_detached(&cfg, &cfg_path).await
-            } else {
-                up(&cfg, &cfg_path, cli.stop_timeout, cli.no_color).await
+            match cfg.selected_services(&args.services) {
+                Ok(selected) => {
+                    if let Err(e) = check_no_running_session(&cfg_path) {
+                        eprintln!("error: {e}");
+                        1
+                    } else if args.detach {
+                        up_detached(&cfg, &cfg_path, &selected).await
+                    } else {
+                        up(&cfg, &cfg_path, &selected, cli.stop_timeout, cli.no_color).await
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    1
+                }
             }
+        }
+        Command::Restart(args) => {
+            let cfg = match Config::load(&cfg_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+            restart_cmd(&cfg, &cfg_path, args.services, cli.stop_timeout).await
         }
         Command::Down => down_cmd(&cfg_path, cli.stop_timeout).await,
         Command::Logs(args) => {
@@ -157,8 +190,8 @@ fn check_no_running_session(cfg_path: &Path) -> Result<(), String> {
 }
 
 /// 后台启动全部服务：按依赖波次 spawn，同步等待各层就绪后写状态退出。
-async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
-    if cfg.services.is_empty() {
+async fn up_detached(cfg: &Config, cfg_path: &Path, selected: &BTreeSet<String>) -> i32 {
+    if selected.is_empty() {
         eprintln!("error: no services defined in {}", cfg_path.display());
         return 1;
     }
@@ -170,7 +203,7 @@ async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
             return 1;
         }
     };
-    let required = cfg.required_conditions();
+    let required = cfg.required_conditions_for(selected);
 
     let base = cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let dir = session::session_dir(cfg_path);
@@ -188,6 +221,9 @@ async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
         // 依赖失败检查 + spawn 本层。
         let mut wave = Vec::new();
         for name in level {
+            if !selected.contains(name) {
+                continue;
+            }
             let svc = &cfg.services[name];
             if cfg.deps_of(name).keys().any(|d| failed.contains(d)) {
                 eprintln!("error: service '{name}' skipped: dependency failed to start");
@@ -252,14 +288,14 @@ async fn up_detached(cfg: &Config, cfg_path: &Path) -> i32 {
         return 1;
     }
 
-    let names: Vec<&str> = cfg.services.keys().map(|s| s.as_str()).collect();
+    let names: Vec<&str> = selected.iter().map(String::as_str).collect();
     runner::print_status(&format!(
         "started {} service(s) in background: {}",
         record.services.len(),
         names.join(", ")
     ));
     runner::print_status(&term::dim(
-        "logs: yun-dev-manage logs --follow · status: yun-dev-manage ps · stop: yun-dev-manage down",
+        "logs: yun-dev-manage logs -f · status: yun-dev-manage ps · stop: yun-dev-manage down",
     ));
     if failures > 0 {
         1
@@ -298,6 +334,126 @@ fn wait_completed_sync(child: &mut std::process::Child) -> bool {
             }
             Err(_) => return false,
         }
+    }
+}
+
+/// 解析重启目标。显式名称必须存在于当前后台会话；空列表选择会话中的全部服务。
+fn restart_targets(
+    record: &session::Session,
+    requested: &[String],
+) -> Result<Vec<String>, String> {
+    if requested.is_empty() {
+        return Ok(record.services.iter().map(|s| s.name.clone()).collect());
+    }
+
+    let requested: HashSet<&str> = requested.iter().map(String::as_str).collect();
+    for name in &requested {
+        if !record.services.iter().any(|s| s.name == *name) {
+            return Err(format!("service '{name}' is not in the background session"));
+        }
+    }
+    Ok(record
+        .services
+        .iter()
+        .filter(|s| requested.contains(s.name.as_str()))
+        .map(|s| s.name.clone())
+        .collect())
+}
+
+/// 停止一个后台服务，返回时原 pid 已退出；超时后升级为 SIGKILL。
+fn stop_for_restart(service: &session::SessionService, stop_timeout: u64) -> Result<(), String> {
+    if !session::is_alive(service.pid) {
+        return Ok(());
+    }
+
+    runner::print_status(&format!("stopping {} (pid {})", service.name, service.pid));
+    runner::signal_group(service.pid, graceful_signal());
+    let exited = stop_timeout > 0
+        && session::wait_exited(service.pid, Duration::from_secs(stop_timeout));
+    if exited {
+        return Ok(());
+    }
+
+    runner::signal_group(service.pid, sigkill());
+    if session::wait_exited(service.pid, Duration::from_secs(2)) {
+        Ok(())
+    } else {
+        Err(format!("service '{}' did not stop", service.name))
+    }
+}
+
+/// 重启后台会话中的指定服务；已退出服务直接重新启动。
+async fn restart_cmd(
+    cfg: &Config,
+    cfg_path: &Path,
+    requested: Vec<String>,
+    stop_timeout: u64,
+) -> i32 {
+    let Some(mut record) = session::load(cfg_path) else {
+        eprintln!("error: no background session for {}", cfg_path.display());
+        return 1;
+    };
+    let targets = match restart_targets(&record, &requested) {
+        Ok(targets) if !targets.is_empty() => targets,
+        Ok(_) => {
+            eprintln!("error: background session has no services to restart");
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    for name in &targets {
+        if !cfg.services.contains_key(name) {
+            eprintln!("error: service '{name}' is no longer defined in the configuration");
+            return 1;
+        }
+    }
+
+    let base = cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let mut failures = 0;
+    let mut restarted = 0;
+    for name in targets {
+        let index = record
+            .services
+            .iter()
+            .position(|service| service.name == name)
+            .expect("restart target belongs to session");
+        let previous_pid = record.services[index].pid;
+        if let Err(e) = stop_for_restart(&record.services[index], stop_timeout) {
+            eprintln!("error: {e}");
+            failures += 1;
+            continue;
+        }
+
+        runner::print_status(&format!("starting {name}"));
+        let service = &cfg.services[&name];
+        let log = record.services[index].log.clone();
+        match runner::spawn_detached(&name, service, &base, &log) {
+            Ok(child) => {
+                let pid = child.id();
+                record.services[index].pid = pid;
+                if let Err(e) = session::save(cfg_path, &record) {
+                    runner::signal_group(pid, sigkill());
+                    record.services[index].pid = previous_pid;
+                    eprintln!("error: {e}");
+                    return 1;
+                }
+                runner::print_status(&format!("restarted {name} (pid {pid})"));
+                restarted += 1;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                failures += 1;
+            }
+        }
+    }
+    if failures > 0 {
+        1
+    } else {
+        runner::print_status(&format!("restarted {restarted} service(s)"));
+        0
     }
 }
 
@@ -385,6 +541,14 @@ async fn logs_cmd(
         eprintln!("error: no background session for {}", cfg_path.display());
         return 1;
     };
+    if let Some(name) = services
+        .iter()
+        .find(|name| !record.services.iter().any(|service| service.name == **name))
+    {
+        eprintln!("error: service '{name}' is not in the background session");
+        return 1;
+    }
+
     let colors_on = use_color(no_color);
     let width = record.services.iter().map(|s| s.name.len()).max().unwrap_or(0);
 
@@ -491,8 +655,14 @@ async fn tail_offset(path: &Path, n: usize) -> u64 {
     0
 }
 
-async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) -> i32 {
-    if cfg.services.is_empty() {
+async fn up(
+    cfg: &Config,
+    cfg_path: &Path,
+    selected: &BTreeSet<String>,
+    stop_timeout: u64,
+    no_color: bool,
+) -> i32 {
+    if selected.is_empty() {
         eprintln!("error: no services defined in {}", cfg_path.display());
         return 1;
     }
@@ -504,10 +674,10 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
             return 1;
         }
     };
-    let required = cfg.required_conditions();
+    let required = cfg.required_conditions_for(selected);
 
     let colors_on = use_color(no_color);
-    let names: Vec<&str> = cfg.services.keys().map(|s| s.as_str()).collect();
+    let names: Vec<&str> = selected.iter().map(String::as_str).collect();
     runner::print_status(&term::dim(&format!(
         "Using {} · {} service(s): {}",
         cfg_path.display(),
@@ -515,7 +685,7 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
         names.join(", ")
     )));
 
-    let width = cfg.max_name_width();
+    let width = selected.iter().map(String::len).max().unwrap_or(0);
     let base = cfg_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let shutdown = Arc::new(Shutdown::new());
     let pids: SharedPids = Arc::new(Mutex::new(Vec::new()));
@@ -523,7 +693,12 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
     let (tx, mut rx) = mpsc::channel::<ServiceEvent>(64);
     let mut gates: HashMap<String, Arc<Notify>> = HashMap::new();
 
-    for (i, (name, svc)) in cfg.services.iter().enumerate() {
+    for (i, (name, svc)) in cfg
+        .services
+        .iter()
+        .filter(|(name, _)| selected.contains(*name))
+        .enumerate()
+    {
         let gate = Arc::new(Notify::new());
         gates.insert(name.clone(), gate.clone());
         let startup = Arc::new(runner::Startup {
@@ -549,7 +724,7 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
     drop(tx);
 
     // 第 0 波无依赖，立即触发。
-    for name in &levels[0] {
+    for name in levels[0].iter().filter(|name| selected.contains(*name)) {
         gates[name].notify_one();
     }
 
@@ -589,15 +764,18 @@ async fn up(cfg: &Config, cfg_path: &Path, stop_timeout: u64, no_color: bool) ->
                 }
                 // 当前波全部 settle → 触发下一波。
                 while wave + 1 < levels.len()
-                    && levels[wave].iter().all(|n| settled.contains(n))
+                    && levels[wave]
+                        .iter()
+                        .filter(|name| selected.contains(*name))
+                        .all(|n| settled.contains(n))
                 {
                     wave += 1;
-                    for name in &levels[wave] {
+                    for name in levels[wave].iter().filter(|name| selected.contains(*name)) {
                         gates[name].notify_one();
                     }
                 }
                 // 结束判定：自然退出（全部最终事件）或停机后已启动服务全部结束。
-                if !shutting_down && finished.len() == cfg.services.len() {
+                if !shutting_down && finished.len() == selected.len() {
                     break;
                 }
                 if shutting_down && spawned.iter().all(|n| finished.contains(n)) {

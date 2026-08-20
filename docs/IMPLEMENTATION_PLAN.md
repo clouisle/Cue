@@ -33,4 +33,11 @@
 3. [x] 集成测试与 fixture
 4. [x] 全量验证与提交
 
-See docs/plan/yun-dev-manage.md
+## yun-dev-manage：服务定向命令
+
+1. [x] 服务选择与依赖闭包（`up [SERVICE...]`）
+2. [x] 后台 `restart [SERVICE...]`
+3. [x] `logs -f [SERVICE...]` 与 CLI 短选项切换
+4. [x] 集成测试、文档与全量验证
+
+See docs/plan/yun-dev-manage.md and docs/plan/service-targeted-commands.md

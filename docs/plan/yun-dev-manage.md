@@ -26,8 +26,8 @@
 
 ```
 src/
-  main.rs    CLI 入口（clap derive）：up(-d) / down / logs / ps / config / validate；信号处理与退出码汇总
-  config.rs  .yun-dev.json 模型（serde）、自动发现（向上逐级查找）、校验
+  main.rs    CLI 入口（clap derive）：up(-d, service...) / restart / down / logs / ps / config / validate；信号处理与退出码汇总
+  config.rs  .yun-dev.json 模型（serde）、自动发现（向上逐级查找）、校验、服务选择依赖闭包
   session.rs 后台会话状态文件（cache 目录、pid/日志路径记录、存活检测）
   runner.rs  服务进程 spawn、日志行流读取与打印、重启策略、进程组信号
   term.rs    ANSI 颜色调色板、前缀格式化
@@ -37,7 +37,7 @@ src/
 
 ```
 前台 up:
-main: 解析 CLI → 加载配置 → 拓扑分层（levels）→ 逐波次触发服务 task 的启动闸门
+main: 解析 CLI → 加载配置 → 解析指定服务及其传递依赖 → 拓扑分层（levels）→ 逐波次触发服务 task 的启动闸门
 每个服务 task: 等闸门 → 校验依赖就绪 → spawn 子进程(新进程组) → 双 reader(stdout/stderr) → mpsc 行流 → 打印
   首轮 spawn 后按最严依赖条件上报就绪：started 立即 / healthy 轮询通过 / completed 退出码 0
   main 收齐本波次就绪(或失败)后触发下一波次闸门；失败传播：依赖方跳过启动
@@ -45,12 +45,12 @@ main: 全部波次启动完进入 select { Ctrl+C, 全部服务退出 }
   Ctrl+C → 置 shutdown 标志 → 对全部进程组发 SIGTERM → 等 stop-timeout → SIGKILL
   全部退出 → 汇总退出码（任一服务非零码退出=1，否则 0）
 
-后台 up -d / down / logs / ps:
-up -d:   按波次 spawn（stdout/stderr → cache 日志文件）→ 同步等待本波次就绪 → 写状态文件 → 退出
+后台 up -d / restart / down / logs / ps:
+up -d:   按所选服务及其依赖的波次 spawn（stdout/stderr → cache 日志文件）→ 同步等待本波次就绪 → 写状态文件 → 退出
+restart: 停止会话内指定（或全部）服务 → 逐个用当前配置和原日志文件重启 → 每次替换状态中的 pid
 ps:      读状态文件 → 按 pid 存活检测 → 打印 running/exited 表
-logs:    读状态文件 → 按需 dump / -f 轮询增量 → 打印带服务名前缀
+logs:    读状态文件 → 按需 dump / `-f` 轮询增量 → 打印带服务名前缀
 down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout → SIGKILL → 删状态文件
-```
 
 ### 配置格式 `.yun-dev.json`
 
@@ -137,11 +137,11 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 - **Files modified**: `src/session.rs`（新增）、`src/runner.rs`、`src/main.rs`
 - **Specific logic**:
   - 状态文件：`$XDG_CACHE_HOME/yun-dev-manage/<config路径hash>/state.json`（fallback `~/.cache`），记录 `version`、`config_path`、每服务 `{name, pid, log}`；日志文件同目录 `<name>.log`，append 打开
-  - `up -d`: 复用 `launch_spec`（command/program 二选一，与前台共享）→ std::process::Command spawn，`process_group(0)`，stdin null、stdout/stderr → 日志文件；spawn 全部后写 state（写失败则 SIGTERM 已起服务并报错）；打印提示（logs/ps/down 用法）；任一 spawn 失败 → 1
+  - `up -d [service...]`: 复用 `launch_spec`（command/program 二选一，与前台共享）→ 仅启动所选服务及其传递依赖，按波次等待就绪后写状态；stdout/stderr → 日志文件；状态写失败则 SIGTERM 已起服务并报错；打印提示（logs/ps/down 用法）；任一 spawn 失败 → 1
   - 前后台互斥：前台 `up` 与 `up -d` 启动前检测 state 中是否有存活 pid → 有则报错提示先 `down`
   - `down`: 对运行中进程组 SIGTERM → 轮询等 stop-timeout → SIGKILL → 删 state（日志文件保留）
   - `ps`: 表格输出 name / pid / running|exited / log 路径；`is_alive` = `kill(pid, 0)`（ESRCH=死，EPERM=活）
-  - `logs [--follow] [--tail N] [service...]`: 默认 dump 全部历史；`--follow` 每 200ms 轮询增量（记录字节偏移）；`--tail N` 从倒数第 N 行开始；每行带服务名彩色前缀（`-f` 为全局 `--file`，故 follow 无短标志）
+  - `logs [-f|--follow] [--tail N] [service...]`: 默认 dump 全部历史；`-f`/`--follow` 每 200ms 轮询增量（记录字节偏移）；`--tail N` 从倒数第 N 行开始；每行带服务名前缀。全局配置路径仅用 `--file`。
   - 后台 spawn 用 std::process（Child drop 不杀进程，工具退出后服务继续跑）；`runner::print_line` 提为 pub 供 logs 复用
 - **Validation**: 集成测试：up -d → ps 显示 running → logs 含前缀历史 → -f 捕获追加行 → 重复 up -d 报错 → 前台 up 报错 → down 清 state
 
@@ -162,6 +162,14 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
   - `Config::load` 在 parse 后 resolve：对 command/program/args/cwd/env 值/healthcheck.test 插值，再 validate
   - `EnvFile`（untagged：字符串或数组，手写 visitor）；spawn_service/spawn_detached 在 env map 之前注入 env_file 键值（env 覆盖 env_file）
 - **Validation**: 单元（parse_env_file/interpolate 各语法）+ 集成（fixture 验证 command 插值、env_file 注入、默认值、shell 环境直通）
+
+### Stage 9: 服务定向命令（up SERVICE / restart / logs -f）
+- **Files modified**: `src/config.rs`、`src/main.rs`、`src/session.rs`、`tests/background.rs`、`testdata/targeted/.yun-dev.json`
+- **Specific logic**:
+  - `Config::selected_services()` 校验显式名称，并递归闭包其 `depends_on`；前台/后台 `up [SERVICE...]` 过滤既有拓扑波次，只启动选集。
+  - `restart [SERVICE...]` 只操作已记录的后台会话服务：先 SIGTERM、按 `--stop-timeout` 等待、必要时 SIGKILL，再以当前配置追加到原日志并持久化新 pid；无名称时覆盖会话中的全部服务。
+  - 全局配置文件选项改为 `--file`，释放 `logs -f` 作为 `--follow` 短选项。
+- **Validation**: 单元覆盖服务选择/未知服务/选择内最严依赖条件；集成覆盖定向前后台启动、依赖闭包、指定与全量 restart、未知 restart 不影响运行服务、以及 `logs -f SERVICE`。
 
 ## Testing Strategy
 - Happy path: 多服务交错日志、前缀与着色、自然退出码汇总

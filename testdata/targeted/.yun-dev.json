@@ -1,0 +1,14 @@
+{
+  "services": {
+    "database": {
+      "command": "echo database started; sleep 30"
+    },
+    "api": {
+      "command": "echo api started; sleep 30",
+      "depends_on": ["database"]
+    },
+    "worker": {
+      "command": "echo worker started; sleep 30"
+    }
+  }
+}

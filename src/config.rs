@@ -1,6 +1,6 @@
 //! `.yun-dev.json` 模型、自动发现与校验。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -540,10 +540,13 @@ impl Config {
     }
 
     /// 每个服务作为依赖需满足的最严条件：healthy > completed > started。
-    pub fn required_conditions(&self) -> BTreeMap<String, DepCondition> {
+    pub fn required_conditions_for(
+        &self,
+        selected: &BTreeSet<String>,
+    ) -> BTreeMap<String, DepCondition> {
         let mut req: BTreeMap<String, DepCondition> = BTreeMap::new();
-        for svc in self.services.values() {
-            for (dep, cond) in svc.depends_on_conditions() {
+        for name in selected {
+            for (dep, cond) in self.deps_of(name) {
                 let cur = req.entry(dep).or_insert(DepCondition::Started);
                 *cur = cur.stricter(cond);
             }
@@ -551,10 +554,41 @@ impl Config {
         req
     }
 
-    /// 所有服务名中最长宽度，用于日志前缀对齐。
-    pub fn max_name_width(&self) -> usize {
-        self.services.keys().map(|k| k.len()).max().unwrap_or(0)
+    /// 解析所请求服务及其传递 `depends_on` 依赖；空请求选择全部服务。
+    pub fn selected_services(&self, names: &[String]) -> Result<BTreeSet<String>, String> {
+        fn include(
+            cfg: &Config,
+            name: &str,
+            selected: &mut BTreeSet<String>,
+        ) -> Result<(), String> {
+            if !cfg.services.contains_key(name) {
+                return Err(format!("unknown service '{name}'"));
+            }
+            if selected.insert(name.to_string()) {
+                for dep in cfg.deps_of(name).keys() {
+                    include(cfg, dep, selected)?;
+                }
+            }
+            Ok(())
+        }
+
+        let names: Vec<&str> = if names.is_empty() {
+            self.services.keys().map(String::as_str).collect()
+        } else {
+            names.iter().map(String::as_str).collect()
+        };
+        let mut selected = BTreeSet::new();
+        for name in names {
+            include(self, name, &mut selected)?;
+        }
+        Ok(selected)
     }
+
+    /// 每个服务作为依赖需满足的最严条件：healthy > completed > started。
+    pub fn required_conditions(&self) -> BTreeMap<String, DepCondition> {
+        self.required_conditions_for(&self.services.keys().cloned().collect())
+    }
+
 }
 
 #[cfg(test)]
@@ -592,7 +626,6 @@ mod tests {
         assert_eq!(be.program.as_deref(), Some("cargo"));
         assert_eq!(be.args, vec!["run"]);
         assert_eq!(be.restart, RestartPolicy::No);
-        assert_eq!(cfg.max_name_width(), 8);
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -678,9 +711,32 @@ mod tests {
     }
 
     #[test]
+    fn selected_services_include_dependencies_and_ignore_unselected_requirements() {
+        let dir = std::env::temp_dir().join(format!("ydev-test-select-{}", std::process::id()));
+        let p = write_config(
+            &dir,
+            r#"{
+                "services": {
+                    "db": { "command": "x", "healthcheck": { "test": "true" } },
+                    "web": { "command": "y", "depends_on": ["db"] },
+                    "api": { "command": "z", "depends_on": { "db": { "condition": "service_healthy" } } }
+                }
+            }"#,
+        );
+        let cfg = Config::load(&p).unwrap();
+        let selected = cfg.selected_services(&["web".to_string()]).unwrap();
+        assert_eq!(selected, BTreeSet::from(["db".to_string(), "web".to_string()]));
+        assert_eq!(cfg.required_conditions_for(&selected)["db"], DepCondition::Started);
+        let err = cfg.selected_services(&["missing".to_string()]).unwrap_err();
+        assert_eq!(err, "unknown service 'missing'");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn levels_chain_and_parallel_waves() {
         let dir = std::env::temp_dir().join(format!("ydev-test7-{}", std::process::id()));
         let p = write_config(
+
             &dir,
             r#"{
                 "services": {
