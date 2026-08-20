@@ -17,7 +17,7 @@
 ### 成功标准
 - `up` 一次拉起所有服务，日志带 `name  | ` 前缀且着色
 - 服务自然退出时打印 `name exited with code N`，全部退出后工具以正确退出码结束
-- Ctrl+C 一次优雅停止（SIGTERM → 超时 → SIGKILL），两次强制立即停止
+- Ctrl+C 一次优雅停止（macOS/Linux：SIGTERM → SIGKILL；Windows：Ctrl+Break → taskkill），两次强制立即停止
 - 部分行（无换行结尾的输出）在进程退出时被冲刷出来，不丢失
 
 ## High-Level Design
@@ -28,8 +28,8 @@
 src/
   main.rs    CLI 入口（clap derive）：up(-d, service...) / restart / down / logs / ps / config / validate；信号处理与退出码汇总
   config.rs  .cue.json 模型（serde）、自动发现（向上逐级查找）、校验、服务选择依赖闭包
-  session.rs 后台会话状态文件（cache 目录、pid/日志路径记录、存活检测）
-  runner.rs  服务进程 spawn、日志行流读取与打印、重启策略、进程组信号
+  session.rs 后台会话状态文件（cache 目录、pid/创建时间/日志路径记录、存活检测）
+  runner.rs  服务进程 spawn、日志行流读取与打印、重启策略、跨平台进程组控制
   term.rs    ANSI 颜色调色板、前缀格式化
 ```
 
@@ -42,7 +42,7 @@ main: 解析 CLI → 加载配置 → 解析指定服务及其传递依赖 → �
   首轮 spawn 后按最严依赖条件上报就绪：started 立即 / healthy 轮询通过 / completed 退出码 0
   main 收齐本波次就绪(或失败)后触发下一波次闸门；失败传播：依赖方跳过启动
 main: 全部波次启动完进入 select { Ctrl+C, 全部服务退出 }
-  Ctrl+C → 置 shutdown 标志 → 对全部进程组发 SIGTERM → 等 stop-timeout → SIGKILL
+  Ctrl+C → 置 shutdown 标志 → Unix：进程组 SIGTERM → SIGKILL；Windows：控制台组 Ctrl+Break → taskkill /F /T
   全部退出 → 汇总退出码（任一服务非零码退出=1，否则 0）
 
 后台 up -d / restart / down / logs / ps:
@@ -50,7 +50,7 @@ up -d:   按所选服务及其依赖的波次 spawn（stdout/stderr → cache �
 restart: 停止会话内指定（或全部）服务 → 逐个用当前配置和原日志文件重启 → 每次替换状态中的 pid
 ps:      读状态文件 → 按 pid 存活检测 → 打印 running/exited 表
 logs:    读状态文件 → 按需 dump / `-f` 轮询增量 → 打印带服务名前缀
-down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout → SIGKILL → 删状态文件
+down:    读状态文件 → Unix：进程组 SIGTERM → SIGKILL；Windows：控制台组 Ctrl+Break → taskkill /F /T → 删状态文件
 
 ### 配置格式 `.cue.json`
 
@@ -79,7 +79,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 
 字段语义：
 - `services`: map，name → 服务定义。name 同时是日志前缀
-- `command`: 字符串，经系统 shell 执行（unix `sh -c` / windows `cmd /C`）
+- `command`: 字符串，经系统 shell 执行（macOS/Linux `sh -c` / Windows `cmd /C`）；跨平台配置推荐 `program` + `args`
 - `program` + `args`: 直接 exec，不经过 shell；与 `command` 二选一（都缺省=校验错误）
 - `cwd`: 相对配置文件所在目录（非当前目录），缺省=配置文件目录
 - `env`: 追加覆盖到继承的环境变量
@@ -95,7 +95,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ### Stage 1: 依赖与骨架
 - **Files modified**: `Cargo.toml`, `src/term.rs`
 - **Specific logic**:
-  - `tokio`(rt-multi-thread/macros/process/io-util/signal/time)、`serde`(derive)、`serde_json`、`clap`(derive)；unix 下 `libc`（进程组信号）
+  - `tokio`(rt-multi-thread/macros/process/io-util/signal/time)、`serde`(derive)、`serde_json`、`clap`(derive)；Unix 下 `libc`（进程组信号），Windows 下 `windows-sys`（控制台事件与进程身份）
   - `term.rs`: 8 色调色板按服务序取色；`paint(code, s)` 输出 ANSI；颜色开关由调用方决定（TTY && !NO_COLOR && !--no-color）
 - **Validation**: `cargo build` 通过
 
@@ -110,7 +110,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ### Stage 3: runner.rs 进程编排与日志流
 - **Files modified**: `src/runner.rs`
 - **Specific logic**:
-  - `spawn_service`: 构造 `tokio::process::Command`；unix 下 `process_group(0)`（子进程成为新进程组组长，便于整树信号）；`cwd` 相对配置目录解析；stdin 置 null、stdout/stderr piped
+  - `spawn_service`: 构造 `tokio::process::Command`；Unix 下 `process_group(0)`，Windows 下 `CREATE_NEW_PROCESS_GROUP`，两者都让服务树拥有独立停止域；`cwd` 相对配置目录解析；stdin 置 null、stdout/stderr piped
   - `read_lines`: `read_until(b'\n')` 字节级行读，`from_utf8_lossy` 解码；EOF 时残留字节也发一行（冲刷部分行）
   - `run_service`: spawn 后双 reader → 每服务一个 mpsc 行流；`select { child.wait(), line }` 边跑边打印；退出后打印 `exited with code N`；按 `restart` 策略与 shutdown 标志决定是否 1s 后重启
   - 行打印：`{name填充}  | {text}`，name 用调色板第 (服务序 % 8) 色；退出/重启消息 dim 灰
@@ -121,7 +121,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 - **Specific logic**:
   - clap: `up`（默认，`--stop-timeout` 默认 10s）/ `config`（打印解析结果）/ `validate`（仅校验）；`--file` 指定配置文件；`--no-color`
   - up 流程：加载配置 → 全部 spawn 后进入 `select { ctrl_c, 全部退出 }`
-  - 优雅停机：置 shutdown → 对每个进程组 `kill(-pid, SIGTERM)`（非 unix 直接 `kill(pid)`）→ 等待全部退出（stop-timeout）→ 超时 `SIGKILL` 全部组再等；等待期间第二次 Ctrl+C 立即强制
+  - 优雅停机：Unix 向进程组发 SIGTERM、超时 SIGKILL；Windows 向控制台进程组发 Ctrl+Break、超时 `taskkill /F /T`；`--stop-timeout 0` 立即强制。两次 Ctrl+C 直接强制。
   - 退出码：任一服务以非零码退出（自然退出或 Ctrl+C 停机后）→ 1；停机时被信号终止的服务不计失败；否则 0
 - **Validation**: 集成测试（见 Stage 5）
 
@@ -136,11 +136,11 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ### Stage 6: 后台模式（up -d / down / logs / ps）
 - **Files modified**: `src/session.rs`（新增）、`src/runner.rs`、`src/main.rs`
 - **Specific logic**:
-  - 状态文件：`$XDG_CACHE_HOME/cue/<配置路径hash>/state.json`（fallback `~/.cache`），记录 `version`、`config_path`、每服务 `{name, pid, log}`；日志文件同目录 `<name>.log`，append 打开
-  - `up -d [service...]`: 复用 `launch_spec`（command/program 二选一，与前台共享）→ 仅启动所选服务及其传递依赖，按波次等待就绪后写状态；stdout/stderr → 日志文件；状态写失败则 SIGTERM 已起服务并报错；打印提示（logs/ps/down 用法）；任一 spawn 失败 → 1
-  - 前后台互斥：前台 `up` 与 `up -d` 启动前检测 state 中是否有存活 pid → 有则报错提示先 `down`
-  - `down`: 对运行中进程组 SIGTERM → 轮询等 stop-timeout → SIGKILL → 删 state（日志文件保留）
-  - `ps`: 表格输出 name / pid / running|exited / log 路径；`is_alive` = `kill(pid, 0)`（ESRCH=死，EPERM=活）
+  - 状态文件：Unix 为 `$XDG_CACHE_HOME/cue/<配置路径hash>/state.json`（fallback `~/.cache`），Windows 为 `%LOCALAPPDATA%\\cue/<配置路径hash>/state.json`；每服务记录 `{name, pid, process_start?, log}`，Windows 创建时间防 PID 复用误杀。
+  - `up -d [service...]`: 复用 `launch_spec`（command/program 二选一，与前台共享）→ 仅启动所选服务及其传递依赖，按波次等待就绪后写状态；stdout/stderr → 日志文件；状态写失败则强制终止已起服务并报错；打印提示（logs/ps/down 用法）；任一 spawn 失败 → 1
+  - 前后台互斥：前台 `up` 与 `up -d` 启动前检测 state 中仍属于本会话的存活服务 → 有则报错提示先 `down`
+  - `down`: Unix 对运行中进程组 SIGTERM → 等待 → SIGKILL；Windows Ctrl+Break → 等待 → `taskkill /F /T`；删状态文件（日志文件保留）
+  - `ps`: 表格输出 name / pid / running|exited / log 路径；Unix 用 `kill(pid, 0)`，Windows 用 `GetExitCodeProcess` + 创建时间核对
   - `logs [-f|--follow] [--tail N] [service...]`: 默认 dump 全部历史；`-f`/`--follow` 每 200ms 轮询增量（记录字节偏移）；`--tail N` 从倒数第 N 行开始；每行带服务名前缀。全局配置路径仅用 `--file`。
   - 后台 spawn 用 std::process（Child drop 不杀进程，工具退出后服务继续跑）；`runner::print_line` 提为 pub 供 logs 复用
 - **Validation**: 集成测试：up -d → ps 显示 running → logs 含前缀历史 → -f 捕获追加行 → 重复 up -d 报错 → 前台 up 报错 → down 清 state
@@ -182,6 +182,6 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ## Risks & Mitigation
 - **子进程 fork 孙进程**：进程组整树信号解决，但孙进程若自行 `setsid` 会脱离 —— 罕见，文档注明
 - **重启热循环**：固定 1s 间隔；`always` 由配置显式声明，用户自担
-- **孤儿进程**：main 退出前保证全部进程组 SIGKILL 送达（短窗口等待）
-- **Windows**：`process_group` 不可用，信号退化为直接 kill 子进程；树内孙进程可能残留 —— 目标平台为 macOS/Linux，Windows 仅保证可编译
+- **孤儿进程**：Unix 保证进程组 SIGKILL 送达，Windows 使用 `taskkill /F /T`；两者对自行脱离控制域的后代均无能为力。
+- **Windows**：通过 `CREATE_NEW_PROCESS_GROUP` + Ctrl+Break 实现优雅停止，`taskkill /F /T` 兜底树终止；若进程自行脱离父子树，与 Unix `setsid` 一样不受管控。
 - **Rollback plan**: 无既有代码，删除即可

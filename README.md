@@ -9,7 +9,7 @@
 - **依赖编排**：`depends_on` + `healthcheck`，按最长依赖链分层启动，依赖未就绪下游不启动
 - **后台模式**：`up -d` 脱离终端运行，`ps` / `restart` / `logs` / `down` 随时管理
 - **服务定向管理**：`up [SERVICE...]` 自动包含传递依赖；`restart [SERVICE...]` 重启后台会话中的指定服务；`logs -f [SERVICE...]` 实时跟随指定服务
-- **优雅停机**：Ctrl+C 一次 SIGTERM（整进程树），超时 SIGKILL，二次强制；SIGTERM 同路径
+- **跨平台生命周期**：macOS/Linux 用进程组 SIGTERM → SIGKILL；Windows 用 Ctrl+Break → `taskkill /F /T`，前后台服务均可管理
 - **变量插值**：`${VAR}` / `${VAR:-默认}`，来源 shell 环境 + 项目 `.env`；`env_file` 注入进程环境
 - **重启策略**：`no` / `always` / `on-failure`（间隔 1s 防热循环）
 
@@ -69,8 +69,8 @@ cue up                      # 读取 .cue.json，准备就绪后一键拉起全�
 
 | 字段 | 说明 |
 |---|---|
-| `command` | 整条 shell 命令（unix `sh -c` / windows `cmd /C`） |
-| `program` + `args` | 直接 exec，不经过 shell；与 `command` 二选一 |
+| `command` | 整条 shell 命令（macOS/Linux 为 `sh -c`；Windows 为 `cmd /C`）。共享配置优先使用 `program` + `args` |
+| `program` + `args` | 直接 exec，不经过 shell；与 `command` 二选一，是跨平台配置的可靠形式 |
 | `cwd` | 工作目录，相对配置文件所在目录；默认配置文件目录 |
 | `env` | 追加覆盖到继承的环境变量 |
 | `env_file` | KEY=VALUE 文件（字符串或数组），相对配置文件目录；`#` 注释、空行、无值 KEY、引号剥离；`env` 覆盖其同名键 |
@@ -96,14 +96,14 @@ Commands:
   restart [SERVICE]...        Restart background session services (default: all)
   ps                          List background session services and status
   logs                        Print background logs [-f|--follow] [--tail N] [SERVICE]...
-  down                        Stop background session (SIGTERM -> timeout -> SIGKILL)
+  down                        Stop background session (graceful stop -> timeout -> force)
   config                      Print the resolved configuration as JSON
   validate                    Validate the configuration only
 
 Options:
       --file <FILE>          指定配置文件（默认向上发现 `.cue.json`）
       --no-color             关闭彩色输出
-      --stop-timeout <SECS>  优雅停机等待秒数，0 = 立即强制 [default: 10]
+      --stop-timeout <SECS>  优雅停机等待秒数，0 = 立即强制终止 [default: 10]
 ```
 
 ### 服务选择与后台管理
@@ -120,6 +120,12 @@ Options:
 - **依赖失败传播**：依赖启动失败（spawn 错误/健康超时/退出非零）→ 依赖方跳过启动，会话退出码 1
 - **颜色开关**：TTY + 无 `NO_COLOR` + 无 `--no-color`
 
+## 平台支持
+
+- **macOS / Linux**：完整支持前台与后台生命周期。每个服务位于独立进程组，优雅停止发送 `SIGTERM`，超时发送 `SIGKILL`。
+- **Windows**：完整支持 `up`、`up -d`、`ps`、`logs -f`、`restart` 与 `down`。每个服务位于独立控制台进程组；优雅停止发送 Ctrl+Break，超时或 `--stop-timeout 0` 使用 `taskkill /F /T` 终止整棵进程树。后台状态保存进程创建时间，拒绝把 PID 复用误判为受管服务。
+- `command` 的 shell 语法不可跨系统共享；需要共享 `.cue.json` 时使用 `program` + `args`。自行脱离进程树的后代不受 Cue 管控，语义等同 Unix 子进程自行 `setsid`。
+
 ## 与 docker compose 的差异
 
 - 面向**本机进程**而非容器：无镜像/网络/卷概念
@@ -130,10 +136,8 @@ Options:
 
 ## 已知边界
 
-- 进程组内孙进程若自行 `setsid` 会脱离信号管控
-- 后台 pid 可能被系统复用导致 `ps` 误判 running（dev 工具可接受）
-- Windows 仅保证可编译（信号退化为 taskkill 整树终止）；目标平台 macOS / Linux
+- 后台状态依赖操作系统进程身份；Unix 平台仍可能因 PID 复用误判 running（dev 工具可接受）。Windows 通过创建时间校验避免误杀复用 PID。
 
 ## 文档
 
-设计文档与实施计划：`docs/plan/cue.md`、`docs/plan/cue-rename.md`、`docs/IMPLEMENTATION_PLAN.md`
+设计文档与实施计划：`docs/plan/cue.md`、`docs/plan/cue-rename.md`、`docs/plan/cue-windows-support.md`、`docs/IMPLEMENTATION_PLAN.md`

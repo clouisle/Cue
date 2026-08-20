@@ -7,13 +7,16 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 const STATE_FILE: &str = "state.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionService {
     pub name: String,
     pub pid: u32,
+    /// Windows 进程创建时间（FILETIME ticks）。用于拒绝 PID 复用；Unix 为 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start: Option<u64>,
     /// 该服务的日志文件（append，原始输出，无前缀）。
     pub log: PathBuf,
 }
@@ -35,6 +38,10 @@ pub fn session_dir(config_path: &Path) -> PathBuf {
 }
 
 fn cache_root() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(local_app_data).join("cue");
+    }
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(x).join("cue");
     }
@@ -77,7 +84,7 @@ pub fn clear(config_path: &Path) {
     std::fs::remove_file(state_path(config_path)).ok();
 }
 
-/// pid 存活检测：`kill(pid, 0)` 成功或 EPERM 视为存活，ESRCH 视为已退出。
+/// pid 存活检测。Unix 使用 `kill(pid, 0)`；Windows 查询退出状态。
 #[cfg(unix)]
 pub fn is_alive(pid: u32) -> bool {
     unsafe {
@@ -86,21 +93,86 @@ pub fn is_alive(pid: u32) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub fn is_alive(pid: u32) -> bool {
-    let _ = pid;
-    false
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let alive = GetExitCodeProcess(handle, &mut exit_code) != 0 && exit_code == 259;
+        let _ = CloseHandle(handle);
+        alive
+    }
 }
 
-/// `pid` 在 `timeout` 内退出则返回 true（轮询 50ms）。
-pub fn wait_exited(pid: u32, timeout: Duration) -> bool {
+/// 捕获 Windows 进程创建时间；Unix 不需要额外的 PID 身份字段。
+#[cfg(windows)]
+pub fn process_start(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        let _ = CloseHandle(handle);
+        ok.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+}
+
+
+/// 判断记录的服务是否仍是原始进程。Windows 创建时间不匹配时视作已退出，避免 PID 复用误杀。
+pub fn is_service_alive(service: &SessionService) -> bool {
+    #[cfg(windows)]
+    {
+        return is_alive(service.pid)
+            && service
+                .process_start
+                .is_some_and(|started| process_start(service.pid) == Some(started));
+    }
+    #[cfg(not(windows))]
+    is_alive(service.pid)
+}
+
+impl SessionService {
+    /// 构造可安全持久化的服务记录。Windows 必须取得创建时间，缺失则不能托管该进程。
+    pub fn new(name: String, pid: u32, log: PathBuf) -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            let process_start = process_start(pid).ok_or_else(|| {
+                format!("cannot read creation time for Windows service '{name}' (pid {pid})")
+            })?;
+            return Ok(Self { name, pid, process_start: Some(process_start), log });
+        }
+        #[cfg(not(windows))]
+        Ok(Self { name, pid, process_start: None, log })
+    }
+}
+
+/// 服务在 `timeout` 内退出则返回 true（轮询 50ms）。
+pub fn wait_service_exited(service: &SessionService, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if !is_alive(pid) {
+        if !is_service_alive(service) {
             return true;
         }
         if Instant::now() >= deadline {
-            return !is_alive(pid);
+            return !is_service_alive(service);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -109,7 +181,7 @@ pub fn wait_exited(pid: u32, timeout: Duration) -> bool {
 impl Session {
     /// 是否有至少一个服务存活。
     pub fn is_any_running(&self) -> bool {
-        self.services.iter().any(|s| is_alive(s.pid))
+        self.services.iter().any(is_service_alive)
     }
 
     /// 全部服务在 `timeout` 内退出则返回 true（轮询 50ms）。
@@ -150,6 +222,7 @@ mod tests {
             services: vec![SessionService {
                 name: "web".into(),
                 pid: 1234,
+                process_start: None,
                 log: session_dir(cfg).join("web.log"),
             }],
         };
@@ -160,5 +233,17 @@ mod tests {
         clear(cfg);
         assert!(load(cfg).is_none());
         std::fs::remove_dir_all(session_dir(cfg)).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_identity_rejects_reused_pid() {
+        let pid = std::process::id();
+        let started = process_start(pid).expect("current process creation time");
+        let service = SessionService::new("self".into(), pid, PathBuf::new())
+            .expect("current process identity");
+        assert!(is_service_alive(&service));
+        let reused = SessionService { process_start: Some(started + 1), ..service };
+        assert!(!is_service_alive(&reused));
     }
 }

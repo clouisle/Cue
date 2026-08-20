@@ -48,4 +48,12 @@
 4. [x] README 与设计文档更名
 5. [x] 全量校验与提交
 
-See docs/plan/cue.md, docs/plan/cue-rename.md, and docs/plan/service-targeted-commands.md
+## Cue：Windows 完整生命周期支持
+
+1. [x] Windows 进程组与两阶段停止设计
+2. [x] 跨平台 graceful/force 生命周期接线
+3. [x] Windows PID 创建时间身份校验与 LOCALAPPDATA session
+4. [x] Windows 后台生命周期集成测试与 CI
+5. [x] 文档与完整回归验证
+
+See docs/plan/cue.md, docs/plan/cue-rename.md, docs/plan/cue-windows-support.md, and docs/plan/service-targeted-commands.md

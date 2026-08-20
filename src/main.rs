@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use tokio::sync::{mpsc, Notify};
 
 use config::Config;
-use runner::{ServiceEvent, SharedPids, Shutdown, signal_all};
+use runner::{ServiceEvent, SharedPids, Shutdown, force_stop_all, request_stop_all};
 
 #[derive(Parser)]
 #[command(
@@ -29,7 +29,7 @@ struct Cli {
     #[arg(long, global = true)]
     no_color: bool,
 
-    /// Seconds to wait for graceful shutdown before SIGKILL (0 = immediate)
+    /// Seconds to wait for graceful shutdown before force termination (0 = immediate)
     #[arg(long, global = true, default_value_t = 10)]
     stop_timeout: u64,
 
@@ -43,7 +43,7 @@ enum Command {
     Up(UpArgs),
     /// Restart background service(s)
     Restart(RestartArgs),
-    /// Stop the background session (SIGTERM -> timeout -> SIGKILL)
+    /// Stop the background session (graceful stop -> timeout -> force)
     Down,
     /// Print or follow background session logs
     Logs(LogsArgs),
@@ -233,15 +233,22 @@ async fn up_detached(cfg: &Config, cfg_path: &Path, selected: &BTreeSet<String>)
             }
             let log = dir.join(format!("{name}.log"));
             match runner::spawn_detached(name, svc, &base, &log) {
-                Ok(child) => {
+                Ok(mut child) => {
                     let pid = child.id();
-                    children.insert(name.clone(), child);
-                    session_services.push(session::SessionService {
-                        name: name.clone(),
-                        pid,
-                        log,
-                    });
-                    wave.push(name.clone());
+                    match session::SessionService::new(name.clone(), pid, log) {
+                        Ok(record) => {
+                            children.insert(name.clone(), child);
+                            session_services.push(record);
+                            wave.push(name.clone());
+                        }
+                        Err(e) => {
+                            runner::force_stop(pid);
+                            let _ = child.wait();
+                            eprintln!("error: {e}");
+                            failed.insert(name.clone());
+                            failures += 1;
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -280,8 +287,8 @@ async fn up_detached(cfg: &Config, cfg_path: &Path, selected: &BTreeSet<String>)
     if let Err(e) = session::save(cfg_path, &record) {
         // 状态写失败：杀掉已起服务，避免孤儿进程。
         for s in &record.services {
-            if session::is_alive(s.pid) {
-                runner::signal_group(s.pid, sigkill());
+            if session::is_service_alive(s) {
+                runner::force_stop(s.pid);
             }
         }
         eprintln!("error: {e}");
@@ -354,28 +361,27 @@ fn restart_targets(
     }
     Ok(record
         .services
-        .iter()
         .filter(|s| requested.contains(s.name.as_str()))
         .map(|s| s.name.clone())
         .collect())
 }
 
-/// 停止一个后台服务，返回时原 pid 已退出；超时后升级为 SIGKILL。
+/// 停止一个后台服务，返回时原 pid 已退出；超时后强制终止。
 fn stop_for_restart(service: &session::SessionService, stop_timeout: u64) -> Result<(), String> {
-    if !session::is_alive(service.pid) {
+    if !session::is_service_alive(service) {
         return Ok(());
     }
 
     runner::print_status(&format!("stopping {} (pid {})", service.name, service.pid));
-    runner::signal_group(service.pid, graceful_signal());
+    runner::request_stop(service.pid);
     let exited = stop_timeout > 0
-        && session::wait_exited(service.pid, Duration::from_secs(stop_timeout));
+        && session::wait_service_exited(service, Duration::from_secs(stop_timeout));
     if exited {
         return Ok(());
     }
 
-    runner::signal_group(service.pid, sigkill());
-    if session::wait_exited(service.pid, Duration::from_secs(2)) {
+    runner::force_stop(service.pid);
+    if session::wait_service_exited(service, Duration::from_secs(2)) {
         Ok(())
     } else {
         Err(format!("service '{}' did not stop", service.name))
@@ -420,7 +426,7 @@ async fn restart_cmd(
             .iter()
             .position(|service| service.name == name)
             .expect("restart target belongs to session");
-        let previous_pid = record.services[index].pid;
+        let previous_service = record.services[index].clone();
         if let Err(e) = stop_for_restart(&record.services[index], stop_timeout) {
             eprintln!("error: {e}");
             failures += 1;
@@ -431,12 +437,22 @@ async fn restart_cmd(
         let service = &cfg.services[&name];
         let log = record.services[index].log.clone();
         match runner::spawn_detached(&name, service, &base, &log) {
-            Ok(child) => {
+            Ok(mut child) => {
                 let pid = child.id();
-                record.services[index].pid = pid;
+                let replacement = match session::SessionService::new(name.clone(), pid, log) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        runner::force_stop(pid);
+                        let _ = child.wait();
+                        eprintln!("error: {e}");
+                        failures += 1;
+                        continue;
+                    }
+                };
+                record.services[index] = replacement;
                 if let Err(e) = session::save(cfg_path, &record) {
-                    runner::signal_group(pid, sigkill());
-                    record.services[index].pid = previous_pid;
+                    runner::force_stop(pid);
+                    record.services[index] = previous_service;
                     eprintln!("error: {e}");
                     return 1;
                 }
@@ -457,14 +473,14 @@ async fn restart_cmd(
     }
 }
 
-/// 停止后台会话：SIGTERM → 等 stop-timeout → SIGKILL → 清状态。
+/// 停止后台会话：优雅停止 → 等 stop-timeout → 强制终止 → 清状态。
 async fn down_cmd(cfg_path: &Path, stop_timeout: u64) -> i32 {
     let Some(record) = session::load(cfg_path) else {
         eprintln!("error: no background session for {}", cfg_path.display());
         return 1;
     };
     let running: Vec<&session::SessionService> =
-        record.services.iter().filter(|s| session::is_alive(s.pid)).collect();
+        record.services.iter().filter(|s| session::is_service_alive(s)).collect();
 
     if running.is_empty() {
         runner::print_status("no running services; clearing session state");
@@ -474,7 +490,7 @@ async fn down_cmd(cfg_path: &Path, stop_timeout: u64) -> i32 {
 
     for s in &running {
         runner::print_status(&format!("stopping {} (pid {})", s.name, s.pid));
-        runner::signal_group(s.pid, graceful_signal());
+        runner::request_stop(s.pid);
     }
     if stop_timeout > 0 {
         record.wait_all_exited(Duration::from_secs(stop_timeout));
@@ -482,8 +498,8 @@ async fn down_cmd(cfg_path: &Path, stop_timeout: u64) -> i32 {
 
     let mut killed = 0;
     for s in &running {
-        if session::is_alive(s.pid) {
-            runner::signal_group(s.pid, sigkill());
+        if session::is_service_alive(s) {
+            runner::force_stop(s.pid);
             killed += 1;
         }
     }
@@ -517,7 +533,7 @@ async fn ps_cmd(cfg_path: &Path) -> i32 {
         "NAME", "PID", "STATUS", "LOG"
     ));
     for s in &record.services {
-        let status = if session::is_alive(s.pid) { "running" } else { "exited" };
+        let status = if session::is_service_alive(s) { "running" } else { "exited" };
         runner::print_status(&format!(
             "{:<name_w$} {:>8}  {:<8} {}",
             s.name,
@@ -802,7 +818,7 @@ async fn up(
                         runner::print_status(&term::dim("Shutdown timeout reached; forced."));
                     });
                 }
-                signal_all(&pids.lock().unwrap(), graceful_signal());
+                request_stop_all(&pids.lock().unwrap());
                 if stop_timeout == 0 {
                     force_kill(&pids);
                 }
@@ -817,38 +833,11 @@ async fn up(
     }
 }
 
-/// SIGTERM（unix）或 taskkill 语义（其他平台）。
-#[cfg(unix)]
-fn graceful_signal() -> i32 {
-    libc::SIGTERM
-}
-
-#[cfg(unix)]
-fn sigkill() -> i32 {
-    libc::SIGKILL
-}
-
-#[cfg(not(unix))]
-fn graceful_signal() -> i32 {
-    0
-}
-
-#[cfg(not(unix))]
-fn sigkill() -> i32 {
-    0
-}
-
-#[cfg(unix)]
 fn force_kill(pids: &SharedPids) {
-    signal_all(&pids.lock().unwrap(), libc::SIGKILL);
+    force_stop_all(&pids.lock().unwrap());
 }
 
-#[cfg(not(unix))]
-fn force_kill(pids: &SharedPids) {
-    signal_all(&pids.lock().unwrap(), 0);
-}
-
-/// Ctrl+C 或 SIGTERM（unix）触发优雅停机；二者路径一致。
+/// Ctrl+C（及 Unix SIGTERM）触发优雅停机；两者路径一致。
 #[cfg(unix)]
 async fn ctrl_c_or_term() {
     use tokio::signal::unix::{SignalKind, signal};

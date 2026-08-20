@@ -185,8 +185,7 @@ fn env_file_entries(
     Ok(entries)
 }
 
-/// 按配置 spawn 一个服务；unix 下子进程成为新进程组组长（`process_group(0)`），
-/// 便于对整棵进程树发信号。
+/// 按配置 spawn 一个服务，并隔离其生命周期控制域：Unix 用进程组，Windows 用控制台进程组。
 pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Child, String> {
     let spec = launch_spec(svc);
     let mut cmd = match &spec {
@@ -217,6 +216,12 @@ pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Ch
 
     #[cfg(unix)]
     cmd.process_group(0);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    }
 
     cmd.spawn().map_err(|e| format!("service '{name}': failed to start: {e}"))
 }
@@ -268,6 +273,11 @@ pub fn spawn_detached(
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
     }
 
     let child = cmd
@@ -482,26 +492,61 @@ pub async fn wait_healthy(hc: config::Healthcheck, shutdown: &Shutdown) -> bool 
     }
 }
 
-/// 向进程组发信号。unix 下 `kill(-pid, sig)` 覆盖整棵进程树；
-/// 其他平台退化为 taskkill 整树终止。
+/// 请求服务及其子进程优雅退出。Unix 发 `SIGTERM`；Windows 发 `CTRL_BREAK_EVENT`。
 #[cfg(unix)]
-pub fn signal_group(pid: u32, sig: i32) {
-    // 组已不存在（ESRCH）等情况静默忽略。
+pub fn request_stop(pid: u32) {
     unsafe {
-        libc::kill(-(pid as i32), sig);
+        libc::kill(-(pid as i32), libc::SIGTERM);
     }
 }
 
-#[cfg(not(unix))]
-pub fn signal_group(pid: u32, _sig: i32) {
-    let _ = std::process::Command::new("taskkill")
+/// 请求服务及其子进程优雅退出。先尝试当前控制台；失败时附着目标控制台重试。
+#[cfg(windows)]
+pub fn request_stop(pid: u32) {
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent,
+    };
+
+    unsafe {
+        if GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0 {
+            return;
+        }
+        let _ = FreeConsole();
+        if AttachConsole(pid) != 0 {
+            let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid);
+            let _ = FreeConsole();
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+/// 强制终止服务及其子进程。Unix 终止进程组；Windows 使用系统树终止命令。
+#[cfg(unix)]
+pub fn force_stop(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+pub fn force_stop(pid: u32) {
+    let _ = std::process::Command::new("taskkill.exe")
         .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status();
 }
 
-pub fn signal_all(pids: &[u32], sig: i32) {
+pub fn request_stop_all(pids: &[u32]) {
     for &pid in pids {
-        signal_group(pid, sig);
+        request_stop(pid);
+    }
+}
+
+pub fn force_stop_all(pids: &[u32]) {
+    for &pid in pids {
+        force_stop(pid);
     }
 }
 
