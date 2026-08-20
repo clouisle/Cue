@@ -15,7 +15,7 @@ Cue currently validates source on Ubuntu and Windows but publishes no ready-to-r
 
 ## High-Level Design
 
-`.github/workflows/release.yml` is independent from the source-validation CI. Its only trigger is `push.tags: ['*']`.
+`.github/workflows/ci.yml` validates only branch pushes and pull requests; `.github/workflows/release.yml` is the sole tag-triggered workflow and uses `push.tags: ['*']`.
 
 A four-entry build matrix installs the stable Rust toolchain with the corresponding compilation target, runs `cargo build --locked --release --target`, and packages just the resulting `cue` executable. Unix artifacts use `tar.gz`; Windows uses `zip`. Each archive is uploaded as a workflow artifact.
 
@@ -25,9 +25,9 @@ A dependent Ubuntu release job downloads all archives, writes `SHA256SUMS`, and 
 
 ### Stage 1: Define release architecture
 
-- **Files modified**: `docs/IMPLEMENTATION_PLAN.md`, `docs/plan/cue-tagged-releases.md`
-- **Specific logic**: Record platform targets, event boundaries, artifact formats, and release permissions.
-- **Validation**: Confirm the CI workflow remains responsible for branch/PR validation and the release workflow is tag-only.
+- **Files modified**: `.github/workflows/ci.yml`, `docs/IMPLEMENTATION_PLAN.md`, `docs/plan/cue-tagged-releases.md`
+- **Specific logic**: Record platform targets, event boundaries, artifact formats, and release permissions; restrict validation CI to branch pushes so tags execute only the release workflow.
+- **Validation**: Confirm CI remains responsible for branch/PR validation and tags match only the release workflow.
 
 ### Stage 2: Build and package platform artifacts
 
