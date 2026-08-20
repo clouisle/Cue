@@ -361,6 +361,7 @@ fn restart_targets(
     }
     Ok(record
         .services
+        .iter()
         .filter(|s| requested.contains(s.name.as_str()))
         .map(|s| s.name.clone())
         .collect())

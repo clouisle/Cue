@@ -218,10 +218,7 @@ pub(crate) fn spawn_service(name: &str, svc: &Service, base: &Path) -> Result<Ch
     cmd.process_group(0);
 
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
-    }
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
 
     cmd.spawn().map_err(|e| format!("service '{name}': failed to start: {e}"))
 }
