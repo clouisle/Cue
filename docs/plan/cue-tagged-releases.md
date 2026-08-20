@@ -9,7 +9,7 @@ Cue currently validates source on Ubuntu and Windows but publishes no ready-to-r
 ### Success criteria
 
 - Pushing any Git tag triggers the release workflow; branch and pull-request updates never trigger it.
-- The workflow builds `cue` from the locked dependency set for Linux x86_64, macOS Intel, macOS Apple Silicon, and Windows x86_64.
+- The workflow builds `cue` from the locked dependency set for Linux x86_64, macOS Apple Silicon, and Windows x86_64.
 - Each platform artifact is packaged with an unambiguous target-specific name and attached to the GitHub Release for the pushed tag.
 - The release also contains a SHA-256 checksum manifest.
 
@@ -17,7 +17,7 @@ Cue currently validates source on Ubuntu and Windows but publishes no ready-to-r
 
 `.github/workflows/ci.yml` validates only branch pushes and pull requests; `.github/workflows/release.yml` is the sole tag-triggered workflow and uses `push.tags: ['*']`.
 
-A four-entry build matrix installs the stable Rust toolchain with the corresponding compilation target, runs `cargo build --locked --release --target`, and packages just the resulting `cue` executable. Unix artifacts use `tar.gz`; Windows uses `zip`. Each archive is uploaded as a workflow artifact.
+A three-entry build matrix installs the stable Rust toolchain with the corresponding compilation target, runs `cargo build --locked --release --target`, and packages just the resulting `cue` executable. Unix artifacts use `tar.gz`; Windows uses `zip`. Each archive is uploaded as a workflow artifact.
 
 A dependent Ubuntu release job downloads all archives, writes `SHA256SUMS`, and invokes `softprops/action-gh-release` with `GITHUB_TOKEN` permission to create or update the release matching `github.ref_name`.
 
@@ -32,7 +32,7 @@ A dependent Ubuntu release job downloads all archives, writes `SHA256SUMS`, and 
 ### Stage 2: Build and package platform artifacts
 
 - **Files modified**: `.github/workflows/release.yml`
-- **Specific logic**: Add a four-platform build matrix, locked release builds, platform-native archive commands, and artifact upload.
+- **Specific logic**: Add a three-platform build matrix, locked release builds, platform-native archive commands, and artifact upload.
 - **Validation**: Parse the workflow and verify every matrix target, executable path, archive extension, and upload path agree.
 
 ### Stage 3: Publish releases and document use
