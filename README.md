@@ -20,6 +20,17 @@ cargo build --release
 cp target/release/cue ~/.cargo/bin/
 ```
 
+### 预编译发行版
+
+推送任意 Git tag（例如 `git tag v0.1.0 && git push origin v0.1.0`）会自动创建同名 GitHub Release，包含以下已打包二进制：
+
+- Linux x86_64：`cue-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Intel：`cue-x86_64-apple-darwin.tar.gz`
+- macOS Apple Silicon：`cue-aarch64-apple-darwin.tar.gz`
+- Windows x86_64：`cue-x86_64-pc-windows-msvc.zip`
+
+从 [Releases](https://github.com/clouisle/Cue/releases) 下载对应归档，解压后将 `cue`（Windows 为 `cue.exe`）放入 `PATH`。每个发行版随附 `SHA256SUMS`，可在安装前校验下载内容。
+
 ## 快速开始
 
 ```bash

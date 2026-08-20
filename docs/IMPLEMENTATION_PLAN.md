@@ -56,4 +56,12 @@
 4. [x] Windows 后台生命周期集成测试与 CI
 5. [x] 文档与完整回归验证
 
-See docs/plan/cue.md, docs/plan/cue-rename.md, docs/plan/cue-windows-support.md, and docs/plan/service-targeted-commands.md
+## Cue：标签发行版自动化
+
+1. [ ] 标签触发与多平台构建矩阵
+2. [ ] 平台归档、校验和与 GitHub Release 发布
+3. [ ] 发行版使用文档与工作流验证
+
+See docs/plan/cue-tagged-releases.md
+
+See docs/plan/cue.md, docs/plan/cue-rename.md, docs/plan/cue-windows-support.md, docs/plan/service-targeted-commands.md, and docs/plan/cue-tagged-releases.md
