@@ -44,6 +44,20 @@ fn run(cwd: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Detached services can inherit the caller's output handle on Windows; do not pipe this launcher.
+fn run_detached(cwd: &std::path::Path) -> i32 {
+    Command::new(BIN)
+        .current_dir(cwd)
+        .args(["up", "-d"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("start detached cue")
+        .code()
+        .unwrap_or(-1)
+}
+
 fn run_bin(cwd: &std::path::Path, args: &[&str]) -> Child {
     Command::new(BIN)
         .current_dir(cwd)
@@ -98,8 +112,8 @@ fn foreground_command_streams_logs_on_windows() {
 fn detached_services_report_restart_follow_and_stop_on_windows() {
     let project = project_dir();
 
-    let (code, out, err) = run(&project, &["up", "-d"]);
-    assert_eq!(code, 0, "up -d failed:\n{out}\n{err}");
+    let code = run_detached(&project);
+    assert_eq!(code, 0, "up -d failed");
 
     let (_, ps, _) = run(&project, &["ps"]);
     assert!(ps.contains("ticker") && ps.contains("running"), "{ps}");
