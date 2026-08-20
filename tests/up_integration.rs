@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_yun-dev-manage");
+const BIN: &str = env!("CARGO_BIN_EXE_cue");
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
@@ -100,14 +100,14 @@ fn validate_and_config_subcommands() {
 
 #[test]
 fn errors_when_config_missing_or_invalid() {
-    let empty = std::env::temp_dir().join(format!("ydev-empty-{}", std::process::id()));
+    let empty = std::env::temp_dir().join(format!("cue-empty-{}", std::process::id()));
     std::fs::create_dir_all(&empty).unwrap();
     let e = Command::new(BIN).current_dir(&empty).arg("up").output().expect("run up");
     assert_eq!(e.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&e.stderr).contains(".yun-dev.json"));
+    assert!(String::from_utf8_lossy(&e.stderr).contains(".cue.json"));
     std::fs::remove_dir_all(&empty).ok();
 
-    let dir = std::env::temp_dir().join(format!("ydev-bad-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cue-bad-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("bad.json"), r#"{"services":{"x":{}}}"#).unwrap();
     let out = Command::new(BIN)

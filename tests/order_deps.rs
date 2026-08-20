@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_yun-dev-manage");
+const BIN: &str = env!("CARGO_BIN_EXE_cue");
 
 static ORDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -49,14 +49,14 @@ fn up_then_sigint(cwd: &std::path::Path, wait_ms: u64) -> (i32, String) {
 fn dependency_graph_starts_all_services() {
     let _lock = ORDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let order = fixture("order");
-    let _ = std::fs::remove_file("/tmp/ydev-order-db-ready");
+    let _ = std::fs::remove_file("/tmp/cue-order-db-ready");
     let (code, out) = up_then_sigint(&order, 2000);
     assert_eq!(code, 0, "all services exited 0 before SIGINT:\n{out}");
     assert!(out.contains("db up"), "db must start:\n{out}");
     assert!(out.contains("backend started"), "backend must start:\n{out}");
     assert!(out.contains("frontend started"), "frontend must start:\n{out}");
     assert!(out.contains("migrated") && out.contains("app up"), "all dependency paths must run:\n{out}");
-    let _ = std::fs::remove_file("/tmp/ydev-order-db-ready");
+    let _ = std::fs::remove_file("/tmp/cue-order-db-ready");
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn unhealthy_dependency_blocks_dependents() {
 fn up_detached_waits_for_dependencies() {
     let order = fixture("order");
     let _lock = ORDER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = std::fs::remove_file("/tmp/ydev-order-db-ready");
+    let _ = std::fs::remove_file("/tmp/cue-order-db-ready");
     let (code, out, err) = run(&order, &["up", "-d"]);
     assert_eq!(code, 0, "up -d must exit 0: {out} {err}");
     assert!(out.contains("started 5 service(s)"), "{out}");
@@ -89,5 +89,5 @@ fn up_detached_waits_for_dependencies() {
 
     let (code, _, _) = run(&order, &["down"]);
     assert_eq!(code, 0);
-    let _ = std::fs::remove_file("/tmp/ydev-order-db-ready");
+    let _ = std::fs::remove_file("/tmp/cue-order-db-ready");
 }

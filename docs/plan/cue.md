@@ -1,4 +1,4 @@
-# yun-dev-manage 设计文档
+# Cue 设计文档
 
 ## Background & Goals
 
@@ -9,8 +9,8 @@
 - 停止时容易残留孤儿进程
 
 ### 目标
-- 在项目目录下放置 `.yun-dev.json`，一条命令（`yun-dev-manage up`）启动全部服务
-- 自动发现：从当前目录向上逐级查找最近的 `.yun-dev.json`（类似 git 仓库发现）
+- 在项目目录下放置 `.cue.json`，一条命令（`cue up`）启动全部服务
+- 自动发现：从当前目录向上逐级查找最近的 `.cue.json`（类似 git 仓库发现）
 - 日志输出像 docker compose：服务名彩色前缀、多服务交错行流、退出码提示、优雅停机
 - 一个终端完成启动/观察/停止全流程
 
@@ -27,7 +27,7 @@
 ```
 src/
   main.rs    CLI 入口（clap derive）：up(-d, service...) / restart / down / logs / ps / config / validate；信号处理与退出码汇总
-  config.rs  .yun-dev.json 模型（serde）、自动发现（向上逐级查找）、校验、服务选择依赖闭包
+  config.rs  .cue.json 模型（serde）、自动发现（向上逐级查找）、校验、服务选择依赖闭包
   session.rs 后台会话状态文件（cache 目录、pid/日志路径记录、存活检测）
   runner.rs  服务进程 spawn、日志行流读取与打印、重启策略、进程组信号
   term.rs    ANSI 颜色调色板、前缀格式化
@@ -52,7 +52,7 @@ ps:      读状态文件 → 按 pid 存活检测 → 打印 running/exited 表
 logs:    读状态文件 → 按需 dump / `-f` 轮询增量 → 打印带服务名前缀
 down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout → SIGKILL → 删状态文件
 
-### 配置格式 `.yun-dev.json`
+### 配置格式 `.cue.json`
 
 ```json
 {
@@ -103,7 +103,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 - **Files modified**: `src/config.rs`
 - **Specific logic**:
   - `Config { services: BTreeMap<String, Service> }`；`Service { command?, program?, args, cwd?, env, restart }`，`restart` 默认 `No`
-  - `discover(start: &Path) -> Option<PathBuf>`: 从 start 逐级向父目录找 `.yun-dev.json`
+  - `discover(start: &Path) -> Option<PathBuf>`: 从 start 逐级向父目录找 `.cue.json`
   - `load(path) -> Result<Config, String>`: 读文件 → serde_json 解析 → 逐服务校验（command/program 至少一个）
 - **Validation**: 单元测试：默认值、缺 command 报错、坏 JSON 报错、向上发现最近配置
 
@@ -119,7 +119,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ### Stage 4: main.rs CLI 与信号处理
 - **Files modified**: `src/main.rs`
 - **Specific logic**:
-  - clap: `up`（默认，`--stop-timeout` 默认 10s）/ `config`（打印解析结果）/ `validate`（仅校验）；`-f/--file` 指定配置文件；`--no-color`
+  - clap: `up`（默认，`--stop-timeout` 默认 10s）/ `config`（打印解析结果）/ `validate`（仅校验）；`--file` 指定配置文件；`--no-color`
   - up 流程：加载配置 → 全部 spawn 后进入 `select { ctrl_c, 全部退出 }`
   - 优雅停机：置 shutdown → 对每个进程组 `kill(-pid, SIGTERM)`（非 unix 直接 `kill(pid)`）→ 等待全部退出（stop-timeout）→ 超时 `SIGKILL` 全部组再等；等待期间第二次 Ctrl+C 立即强制
   - 退出码：任一服务以非零码退出（自然退出或 Ctrl+C 停机后）→ 1；停机时被信号终止的服务不计失败；否则 0
@@ -128,7 +128,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ### Stage 5: 集成测试与冒烟
 - **Files modified**: `tests/`, `testdata/`
 - **Specific logic**:
-  - fixture 项目含 `.yun-dev.json`：frontend（打印若干行后退出 0）、backend（无限循环，用于 SIGINT 停机验证）、worker（`exit 3` 验证失败码汇总）
+  - fixture 项目含 `.cue.json`：frontend（打印若干行后退出 0）、backend（无限循环，用于 SIGINT 停机验证）、worker（`exit 3` 验证失败码汇总）
   - 集成测试：以 fixture 为 cwd 启动二进制 → 断言输出含 `frontend  | ` 前缀 → 对二进制发 SIGINT → 断言优雅退出且退出码为 1（worker 失败）且输出含 `exited with code`
   - 冒烟：真实终端手动运行一次观察配色
 - **Validation**: `cargo test` 全绿；`cargo clippy -- -D warnings` 通过
@@ -136,7 +136,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 ### Stage 6: 后台模式（up -d / down / logs / ps）
 - **Files modified**: `src/session.rs`（新增）、`src/runner.rs`、`src/main.rs`
 - **Specific logic**:
-  - 状态文件：`$XDG_CACHE_HOME/yun-dev-manage/<config路径hash>/state.json`（fallback `~/.cache`），记录 `version`、`config_path`、每服务 `{name, pid, log}`；日志文件同目录 `<name>.log`，append 打开
+  - 状态文件：`$XDG_CACHE_HOME/cue/<配置路径hash>/state.json`（fallback `~/.cache`），记录 `version`、`config_path`、每服务 `{name, pid, log}`；日志文件同目录 `<name>.log`，append 打开
   - `up -d [service...]`: 复用 `launch_spec`（command/program 二选一，与前台共享）→ 仅启动所选服务及其传递依赖，按波次等待就绪后写状态；stdout/stderr → 日志文件；状态写失败则 SIGTERM 已起服务并报错；打印提示（logs/ps/down 用法）；任一 spawn 失败 → 1
   - 前后台互斥：前台 `up` 与 `up -d` 启动前检测 state 中是否有存活 pid → 有则报错提示先 `down`
   - `down`: 对运行中进程组 SIGTERM → 轮询等 stop-timeout → SIGKILL → 删 state（日志文件保留）
@@ -164,7 +164,7 @@ down:    读状态文件 → 对运行中进程组 SIGTERM → 等 stop-timeout 
 - **Validation**: 单元（parse_env_file/interpolate 各语法）+ 集成（fixture 验证 command 插值、env_file 注入、默认值、shell 环境直通）
 
 ### Stage 9: 服务定向命令（up SERVICE / restart / logs -f）
-- **Files modified**: `src/config.rs`、`src/main.rs`、`src/session.rs`、`tests/background.rs`、`testdata/targeted/.yun-dev.json`
+- **Files modified**: `src/config.rs`、`src/main.rs`、`src/session.rs`、`tests/background.rs`、`testdata/targeted/.cue.json`
 - **Specific logic**:
   - `Config::selected_services()` 校验显式名称，并递归闭包其 `depends_on`；前台/后台 `up [SERVICE...]` 过滤既有拓扑波次，只启动选集。
   - `restart [SERVICE...]` 只操作已记录的后台会话服务：先 SIGTERM、按 `--stop-timeout` 等待、必要时 SIGKILL，再以当前配置追加到原日志并持久化新 pid；无名称时覆盖会话中的全部服务。

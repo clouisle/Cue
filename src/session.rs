@@ -25,8 +25,8 @@ pub struct Session {
     pub services: Vec<SessionService>,
 }
 
-/// 会话目录：`$XDG_CACHE_HOME/yun-dev-manage/<配置路径hash>`，
-/// fallback `~/.cache/yun-dev-manage/<hash>`（macOS 同）。
+/// 会话目录：`$XDG_CACHE_HOME/cue/<配置路径hash>`，
+/// fallback `~/.cache/cue/<hash>`（macOS 同）。
 pub fn session_dir(config_path: &Path) -> PathBuf {
     let mut h = DefaultHasher::new();
     let canon = config_path.canonicalize().unwrap_or_else(|_| config_path.to_path_buf());
@@ -36,13 +36,13 @@ pub fn session_dir(config_path: &Path) -> PathBuf {
 
 fn cache_root() -> PathBuf {
     if let Some(x) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(x).join("yun-dev-manage");
+        return PathBuf::from(x).join("cue");
     }
     #[cfg(unix)]
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".cache").join("yun-dev-manage");
+        return PathBuf::from(home).join(".cache").join("cue");
     }
-    std::env::temp_dir().join("yun-dev-manage")
+    std::env::temp_dir().join("cue")
 }
 
 pub fn state_path(config_path: &Path) -> PathBuf {
@@ -133,8 +133,8 @@ mod tests {
 
     #[test]
     fn session_dir_is_stable_and_scoped() {
-        let a = Path::new("/tmp/proj/.yun-dev.json");
-        let b = Path::new("/tmp/other/.yun-dev.json");
+        let a = Path::new("/tmp/proj/.cue.json");
+        let b = Path::new("/tmp/other/.cue.json");
         let d1 = session_dir(a);
         let d2 = session_dir(a);
         assert_eq!(d1, d2);
@@ -143,7 +143,7 @@ mod tests {
 
     #[test]
     fn save_load_roundtrip() {
-        let cfg = Path::new("/tmp/proj/.yun-dev.json");
+        let cfg = Path::new("/tmp/proj/.cue.json");
         let s = Session {
             version: STATE_VERSION,
             config_path: cfg.to_path_buf(),

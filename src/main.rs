@@ -16,12 +16,12 @@ use runner::{ServiceEvent, SharedPids, Shutdown, signal_all};
 
 #[derive(Parser)]
 #[command(
-    name = "yun-dev-manage",
+    name = "cue",
     version,
-    about = "One-command dev service orchestrator driven by .yun-dev.json, with docker-compose style logs"
+    about = "One-command dev service orchestrator driven by .cue.json, with docker-compose style logs"
 )]
 struct Cli {
-    /// Path to the config file (default: nearest .yun-dev.json found upward from cwd)
+    /// Path to the config file (default: nearest .cue.json found upward from cwd)
     #[arg(long, global = true)]
     file: Option<PathBuf>,
 
@@ -182,7 +182,7 @@ fn check_no_running_session(cfg_path: &Path) -> Result<(), String> {
         && s.is_any_running()
     {
         return Err(format!(
-            "background session is running ({} service(s)); run 'yun-dev-manage down' first",
+            "background session is running ({} service(s)); run 'cue down' first",
             s.services.len()
         ));
     }
@@ -295,7 +295,7 @@ async fn up_detached(cfg: &Config, cfg_path: &Path, selected: &BTreeSet<String>)
         names.join(", ")
     ));
     runner::print_status(&term::dim(
-        "logs: yun-dev-manage logs -f · status: yun-dev-manage ps · stop: yun-dev-manage down",
+        "logs: cue logs -f · status: cue ps · stop: cue down",
     ));
     if failures > 0 {
         1

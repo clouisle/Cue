@@ -1,4 +1,4 @@
-//! `.yun-dev.json` 模型、自动发现与校验。
+//! `.cue.json` 模型、自动发现与校验。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-pub const CONFIG_FILE_NAME: &str = ".yun-dev.json";
+pub const CONFIG_FILE_NAME: &str = ".cue.json";
 
 /// 从 `start` 目录开始向上逐级查找最近的配置文件（类似 git 仓库发现）。
 pub fn discover(start: &Path) -> Option<PathBuf> {
@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn parses_full_config_with_defaults() {
-        let dir = std::env::temp_dir().join(format!("ydev-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test-{}", std::process::id()));
         let p = write_config(
             &dir,
             r#"{
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn missing_command_is_error() {
-        let dir = std::env::temp_dir().join(format!("ydev-test2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test2-{}", std::process::id()));
         let p = write_config(&dir, r#"{"services": {"x": {}}}"#);
         let err = Config::load(&p).unwrap_err();
         assert!(err.contains("needs 'command' or 'program'"), "{err}");
@@ -640,7 +640,7 @@ mod tests {
 
     #[test]
     fn bad_json_is_error() {
-        let dir = std::env::temp_dir().join(format!("ydev-test3-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test3-{}", std::process::id()));
         let p = write_config(&dir, "{not json");
         let err = Config::load(&p).unwrap_err();
         assert!(err.contains("invalid"), "{err}");
@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn discovers_nearest_upward() {
-        let dir = std::env::temp_dir().join(format!("ydev-test4-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test4-{}", std::process::id()));
         write_config(&dir, r#"{"services": {}}"#);
         let deep = dir.join("a").join("b");
         fs::create_dir_all(&deep).unwrap();
@@ -660,7 +660,7 @@ mod tests {
 
     #[test]
     fn discover_returns_none_when_absent() {
-        let dir = std::env::temp_dir().join(format!("ydev-test5-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test5-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         assert!(discover(&dir).is_none());
         fs::remove_dir_all(&dir).ok();
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn depends_on_both_forms_and_healthcheck_defaults() {
-        let dir = std::env::temp_dir().join(format!("ydev-test6-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test6-{}", std::process::id()));
         let p = write_config(
             &dir,
             r#"{
@@ -712,7 +712,7 @@ mod tests {
 
     #[test]
     fn selected_services_include_dependencies_and_ignore_unselected_requirements() {
-        let dir = std::env::temp_dir().join(format!("ydev-test-select-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test-select-{}", std::process::id()));
         let p = write_config(
             &dir,
             r#"{
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn levels_chain_and_parallel_waves() {
-        let dir = std::env::temp_dir().join(format!("ydev-test7-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test7-{}", std::process::id()));
         let p = write_config(
 
             &dir,
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn dependency_cycle_and_unknown_dep_are_errors() {
-        let dir = std::env::temp_dir().join(format!("ydev-test8-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test8-{}", std::process::id()));
         let p = write_config(
             &dir,
             r#"{
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn load_applies_dotenv_interpolation_and_env_file() {
-        let dir = std::env::temp_dir().join(format!("ydev-test9-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("cue-test9-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join(".env"),

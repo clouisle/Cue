@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_yun-dev-manage");
+const BIN: &str = env!("CARGO_BIN_EXE_cue");
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)

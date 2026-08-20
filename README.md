@@ -1,10 +1,10 @@
-# yun-dev-manage
+# Cue
 
-一键拉起项目全部开发服务的命令行工具。在项目根目录放一个 `.yun-dev.json`，一个终端、一条命令启动前端/后端/worker 等所有服务，日志输出对齐 docker compose（彩色前缀、交错行流、优雅停机）。
+一键拉起项目全部开发服务的命令行工具。在项目根目录放一个 `.cue.json`，一个终端、一条命令启动前端/后端/worker 等所有服务，日志输出对齐 docker compose（彩色前缀、交错行流、优雅停机）。
 
 ## 特性
 
-- **自动发现**：从当前目录向上逐级查找最近的 `.yun-dev.json`，任意子目录运行即可
+- **自动发现**：从当前目录向上逐级查找最近的 `.cue.json`，任意子目录运行即可
 - **compose 风格日志**：每服务独立彩色前缀（`frontend  | ...`）、stdout/stderr 合并行流、无换行残留输出退出时冲刷
 - **依赖编排**：`depends_on` + `healthcheck`，按最长依赖链分层启动，依赖未就绪下游不启动
 - **后台模式**：`up -d` 脱离终端运行，`ps` / `restart` / `logs` / `down` 随时管理
@@ -17,18 +17,18 @@
 
 ```bash
 cargo build --release
-cp target/release/yun-dev-manage ~/.cargo/bin/
+cp target/release/cue ~/.cargo/bin/
 ```
 
 ## 快速开始
 
 ```bash
 cd 你的项目
-yun-dev-manage              # 读取 .yun-dev.json，拉起全部服务
+cue up                      # 读取 .cue.json，准备就绪后一键拉起全部服务
 # Ctrl+C 一次优雅停止全部；再按一次强制
 ```
 
-## 配置 `.yun-dev.json`
+## 配置 `.cue.json`
 
 完整示例（字段均可选，除 `command`/`program` 二选一）：
 
@@ -89,7 +89,7 @@ yun-dev-manage              # 读取 .yun-dev.json，拉起全部服务
 ## 命令
 
 ```
-yun-dev-manage [OPTIONS] [COMMAND]
+cue [OPTIONS] [COMMAND]
 
 Commands:
   up [--detach] [SERVICE]...  Start selected services and their dependencies (default: all)
@@ -101,7 +101,7 @@ Commands:
   validate                    Validate the configuration only
 
 Options:
-      --file <FILE>          指定配置文件（默认向上发现 `.yun-dev.json`）
+      --file <FILE>          指定配置文件（默认向上发现 `.cue.json`）
       --no-color             关闭彩色输出
       --stop-timeout <SECS>  优雅停机等待秒数，0 = 立即强制 [default: 10]
 ```
@@ -116,7 +116,7 @@ Options:
 
 - **退出码**：任一服务以非零码退出 → 1（自然退出或停机后汇总）；停机时被信号终止的服务不计失败
 - **前后台互斥**：后台会话运行中时，前台 `up` 与 `up -d` 拒绝启动；`restart` 仅操作已有后台会话
-- **会话状态**：`$XDG_CACHE_HOME/yun-dev-manage/<配置路径hash>/`（fallback `~/.cache`），含 `state.json` 与每服务日志文件；`down` 只清状态，日志保留
+- **会话状态**：`$XDG_CACHE_HOME/cue/<配置路径hash>/`（fallback `~/.cache`），含 `state.json` 与每服务日志文件；`down` 只清状态，日志保留
 - **依赖失败传播**：依赖启动失败（spawn 错误/健康超时/退出非零）→ 依赖方跳过启动，会话退出码 1
 - **颜色开关**：TTY + 无 `NO_COLOR` + 无 `--no-color`
 
@@ -136,4 +136,4 @@ Options:
 
 ## 文档
 
-设计文档与实施计划：`docs/plan/yun-dev-manage.md`、`docs/IMPLEMENTATION_PLAN.md`
+设计文档与实施计划：`docs/plan/cue.md`、`docs/plan/cue-rename.md`、`docs/IMPLEMENTATION_PLAN.md`

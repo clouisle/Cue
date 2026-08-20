@@ -1,8 +1,8 @@
 [package]
-name = "yun-dev-manage"
+name = "cue"
 version = "0.1.0"
 edition = "2024"
-description = "One-command service orchestrator driven by .yun-dev.json, with docker-compose style logs"
+description = "One-command service orchestrator driven by .cue.json, with docker-compose style logs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

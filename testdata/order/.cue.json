@@ -4,9 +4,9 @@
       "command": "sleep 0.2; echo migrated; exit 0"
     },
     "db": {
-      "command": "echo db up; touch /tmp/ydev-order-db-ready; sleep 5",
+      "command": "echo db up; touch /tmp/cue-order-db-ready; sleep 5",
       "healthcheck": {
-        "test": "test -f /tmp/ydev-order-db-ready",
+        "test": "test -f /tmp/cue-order-db-ready",
         "interval": "200ms",
         "retries": 20
       }

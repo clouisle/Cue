@@ -37,7 +37,7 @@ The global config option becomes long-only `--file`, releasing `-f` for `logs --
 - **Validation**: Integration-test `logs -f SERVICE` receives subsequent output for that service only.
 
 ### Stage 4: Documentation and regression
-- **Files modified**: `README.md`, `docs/IMPLEMENTATION_PLAN.md`, `docs/plan/yun-dev-manage.md`, `tests/background.rs`
+- **Files modified**: `README.md`, `docs/IMPLEMENTATION_PLAN.md`, `docs/plan/cue.md`, `tests/background.rs`
 - **Specific logic**: Document service selection, dependency inclusion, restart scope, and the `--file` long-option cutover.
 - **Validation**: Run focused integration tests, `cargo test`, and `cargo clippy -- -D warnings`.
 
