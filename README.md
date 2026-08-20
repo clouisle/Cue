@@ -15,6 +15,20 @@
 
 ## 安装
 
+### 一键安装（Linux x86_64 / macOS Apple Silicon）
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/clouisle/Cue/main/scripts/install.sh | sh
+```
+
+脚本下载最新正式 Release、校验 `SHA256SUMS` 后安装到 `~/.local/bin/cue`。使用其他目录时设置 `CUE_INSTALL_DIR`：
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/clouisle/Cue/main/scripts/install.sh | CUE_INSTALL_DIR="$HOME/bin" sh
+```
+
+### 从源码安装
+
 ```bash
 cargo build --release
 cp target/release/cue ~/.cargo/bin/
@@ -22,13 +36,13 @@ cp target/release/cue ~/.cargo/bin/
 
 ### 预编译发行版
 
-推送任意 Git tag（例如 `git tag v0.1.0 && git push origin v0.1.0`）会自动创建同名 GitHub Release，包含以下已打包二进制：
+每个 Git tag 会自动创建同名 GitHub Release，包含以下已打包二进制：
 
 - Linux x86_64：`cue-x86_64-unknown-linux-gnu.tar.gz`
 - macOS Apple Silicon：`cue-aarch64-apple-darwin.tar.gz`
 - Windows x86_64：`cue-x86_64-pc-windows-msvc.zip`
 
-从 [Releases](https://github.com/clouisle/Cue/releases) 下载对应归档，解压后将 `cue`（Windows 为 `cue.exe`）放入 `PATH`。每个发行版随附 `SHA256SUMS`，可在安装前校验下载内容。
+Windows 或需要手动安装时，从 [Releases](https://github.com/clouisle/Cue/releases) 下载对应归档，解压后将 `cue`（Windows 为 `cue.exe`）放入 `PATH`。每个发行版随附 `SHA256SUMS`，可在安装前校验下载内容。
 
 ## 快速开始
 
