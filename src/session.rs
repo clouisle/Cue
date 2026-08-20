@@ -137,29 +137,31 @@ pub fn process_start(pid: u32) -> Option<u64> {
 
 
 /// 判断记录的服务是否仍是原始进程。Windows 创建时间不匹配时视作已退出，避免 PID 复用误杀。
+#[cfg(windows)]
 pub fn is_service_alive(service: &SessionService) -> bool {
-    #[cfg(windows)]
-    {
-        return is_alive(service.pid)
-            && service
-                .process_start
-                .is_some_and(|started| process_start(service.pid) == Some(started));
-    }
-    #[cfg(not(windows))]
+    is_alive(service.pid)
+        && service
+            .process_start
+            .is_some_and(|started| process_start(service.pid) == Some(started))
+}
+
+#[cfg(not(windows))]
+pub fn is_service_alive(service: &SessionService) -> bool {
     is_alive(service.pid)
 }
 
 impl SessionService {
     /// 构造可安全持久化的服务记录。Windows 必须取得创建时间，缺失则不能托管该进程。
+    #[cfg(windows)]
     pub fn new(name: String, pid: u32, log: PathBuf) -> Result<Self, String> {
-        #[cfg(windows)]
-        {
-            let process_start = process_start(pid).ok_or_else(|| {
-                format!("cannot read creation time for Windows service '{name}' (pid {pid})")
-            })?;
-            return Ok(Self { name, pid, process_start: Some(process_start), log });
-        }
-        #[cfg(not(windows))]
+        let process_start = process_start(pid).ok_or_else(|| {
+            format!("cannot read creation time for Windows service '{name}' (pid {pid})")
+        })?;
+        Ok(Self { name, pid, process_start: Some(process_start), log })
+    }
+
+    #[cfg(not(windows))]
+    pub fn new(name: String, pid: u32, log: PathBuf) -> Result<Self, String> {
         Ok(Self { name, pid, process_start: None, log })
     }
 }
