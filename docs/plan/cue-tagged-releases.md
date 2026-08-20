@@ -45,7 +45,7 @@ A dependent Ubuntu release job downloads all archives, writes `SHA256SUMS`, and 
 
 - Static workflow validation: parse the YAML and, when available, run `actionlint`.
 - Build contract: `cargo build --locked --release` locally validates the same locked release-build command used by all matrix entries.
-- Release smoke test: pushing a disposable tag should produce four archives plus `SHA256SUMS` on the matching GitHub Release; delete the disposable tag and release afterward.
+- Release smoke test: a disposable tag produced three archives (`cue-x86_64-unknown-linux-gnu.tar.gz`, `cue-aarch64-apple-darwin.tar.gz`, and `cue-x86_64-pc-windows-msvc.zip`) plus `SHA256SUMS` on its matching GitHub Release; the disposable tag and release are deleted afterward.
 - Regression scope: existing `.github/workflows/ci.yml` continues validating pushes and pull requests independently.
 
 ## Risks & Mitigation

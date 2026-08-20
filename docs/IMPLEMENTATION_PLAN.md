@@ -58,9 +58,9 @@
 
 ## Cue：标签发行版自动化
 
-1. [ ] 标签触发与多平台构建矩阵
-2. [ ] 平台归档、校验和与 GitHub Release 发布
-3. [ ] 发行版使用文档与工作流验证
+1. [x] 标签触发与多平台构建矩阵
+2. [x] 平台归档、校验和与 GitHub Release 发布
+3. [x] 发行版使用文档与工作流验证
 
 See docs/plan/cue-tagged-releases.md
 
