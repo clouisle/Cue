@@ -44,16 +44,17 @@ fn run(cwd: &std::path::Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// Detached services can inherit the caller's output handle on Windows; do not pipe this launcher.
-fn run_detached(cwd: &std::path::Path) -> i32 {
+/// A command that creates detached services can leak its output handle into the service tree on Windows.
+/// Run it without pipes so the test observes the CLI exit, not the service's eventual EOF.
+fn run_lifecycle(cwd: &std::path::Path, args: &[&str]) -> i32 {
     Command::new(BIN)
         .current_dir(cwd)
-        .args(["up", "-d"])
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("start detached cue")
+        .expect("run lifecycle command")
         .code()
         .unwrap_or(-1)
 }
@@ -112,7 +113,7 @@ fn foreground_command_streams_logs_on_windows() {
 fn detached_services_report_restart_follow_and_stop_on_windows() {
     let project = project_dir();
 
-    let code = run_detached(&project);
+    let code = run_lifecycle(&project, &["up", "-d"]);
     assert_eq!(code, 0, "up -d failed");
 
     let (_, ps, _) = run(&project, &["ps"]);
@@ -130,14 +131,14 @@ fn detached_services_report_restart_follow_and_stop_on_windows() {
     let followed = reader.join().expect("join log reader");
     assert!(followed.contains("ticker  | tick-2"), "{followed}");
 
-    let (code, out, err) = run(&project, &["--stop-timeout", "0", "restart", "ticker"]);
-    assert_eq!(code, 0, "restart failed:\n{out}\n{err}");
+    let code = run_lifecycle(&project, &["--stop-timeout", "0", "restart", "ticker"]);
+    assert_eq!(code, 0, "restart failed");
     let (_, ps, _) = run(&project, &["ps"]);
     assert!(ps.contains("ticker") && ps.contains("running"), "{ps}");
     assert_ne!(pid_for(&ps, "ticker"), first_pid, "restart retained pid:\n{ps}");
 
-    let (code, out, err) = run(&project, &["--stop-timeout", "0", "down"]);
-    assert_eq!(code, 0, "down failed:\n{out}\n{err}");
+    let code = run_lifecycle(&project, &["--stop-timeout", "0", "down"]);
+    assert_eq!(code, 0, "down failed");
     let (code, out, _) = run(&project, &["ps"]);
     assert_eq!(code, 1, "session was not cleared:\n{out}");
 
